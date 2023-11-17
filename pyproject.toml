@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=40.8.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neural_transducer"
+version = "0.2.1"
+description = "Neural transducer for grapheme-to-phoneme (Makarov & Clematide 2020)"
+authors = [
+    { name = "Peter Makarov", email = "makarov@cl.uzh.ch" },
+    { name = "Simon Clematide" },
+    { name = "Silvan Wehrli" }
+]
+license = { file = "LICENSE" }
+readme = "README.md"
+requires-python = ">=3.7, <4"
+
+dependencies = [
+    "Cython",
+    #"torch==1.11.0",
+    #"editdistance>=0.5.2",
+    #"numpy==1.19.2",
+    #"progressbar>=2.5",
+    #"scipy>=1.5.4",
+    # "cudatoolkit==11.3" # Uncomment this line if you want to include CUDA toolkit by default
+]
+
+[project.scripts]
+trans-train = "trans.train:cli_main"
+trans-ensemble = "trans.ensembling:cli_main"
+trans-grid-search = "trans.grid_search:cli_main"
