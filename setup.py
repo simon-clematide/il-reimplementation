@@ -26,7 +26,7 @@ setup(name="neural_transducer",
       packages=["trans"],
       test_suite="trans.tests",
       install_requires=install_requires,
-      python_requires="==3.7.*",
+      python_requires='>=3.7, <4',
       entry_points={
           "console_scripts": [
               "trans-train = trans.train:cli_main",
