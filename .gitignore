@@ -10,3 +10,4 @@ __pycache__/
 # packaging
 *.egg
 *.egg-info/
+*.d
