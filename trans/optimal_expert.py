@@ -25,7 +25,7 @@ def edit_distance(x: Sequence[Any], y: Sequence[Any],
                   x_offset: int, y_offset: int) -> np.ndarray:
     x_size = len(x) - x_offset + 1
     y_size = len(y) - y_offset + 1
-    prefix_matrix = np.full((x_size, y_size), np.inf, dtype=np.float_)
+    prefix_matrix = np.full((x_size, y_size), np.inf, dtype=np.float64)
     for i in range(x_size):
         prefix_matrix[i, 0] = i * del_cost
     for j in range(y_size):

@@ -25,7 +25,7 @@ class Adam(torch.optim.Adam):
         parser.add_argument("--betas", type=float, nargs=2, default=(0.9, 0.999))
         parser.add_argument("--eps", type=float, default=1e-08)
         parser.add_argument("--weight-decay", type=float, default=0)
-        parser.add_argument("--amsgrad", type=bool, default=False)
+        parser.add_argument("--amsgrad", action=argparse.BooleanOptionalAction, default=False)
 
 
 @register_component('adamw', 'optimizer')
@@ -47,7 +47,7 @@ class AdamW(torch.optim.AdamW):
         parser.add_argument("--betas", type=float, nargs=2, default=(0.9, 0.999))
         parser.add_argument("--opt-eps", type=float, default=1e-08)
         parser.add_argument("--weight-decay", type=float, default=0)
-        parser.add_argument("--amsgrad", type=bool, default=False)
+        parser.add_argument("--amsgrad", action=argparse.BooleanOptionalAction, default=False)
 
 
 @register_component('adadelta', 'optimizer')
@@ -123,4 +123,4 @@ class ReduceLROnPlateau(torch.optim.lr_scheduler.ReduceLROnPlateau):
         parser.add_argument("--cooldown", type=int, default=0)
         parser.add_argument("--min-lr", type=float, default=0.)
         parser.add_argument("--lrs-eps", type=float, default=1e-8)
-        parser.add_argument("--verbose", type=bool, default=False)
+        parser.add_argument("--verbose", action=argparse.BooleanOptionalAction, default=False)

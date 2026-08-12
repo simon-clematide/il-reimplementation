@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=40.8.0", "wheel"]
+requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -13,17 +13,19 @@ authors = [
 ]
 license = { file = "LICENSE" }
 readme = "README.md"
-requires-python = ">=3.7, <4"
+requires-python = ">=3.13, <3.14"
 
 dependencies = [
-    "Cython",
-    #"torch==1.11.0",
-    #"editdistance>=0.5.2",
-    #"numpy==1.19.2",
-    #"progressbar>=2.5",
-    #"scipy>=1.5.4",
-    # "cudatoolkit==11.3" # Uncomment this line if you want to include CUDA toolkit by default
+    "Cython>=0.29",
+    "torch>=2.6",
+    "editdistance>=0.5.2",
+    "numpy>=1.19",
+    "progressbar>=2.5",
+    "scipy>=1.5.4",
 ]
+
+[tool.setuptools]
+packages = ["trans"]
 
 [project.scripts]
 trans-train = "trans.train:cli_main"

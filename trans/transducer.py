@@ -18,7 +18,6 @@ from trans import ENCODER_MAPPING
 
 
 MAX_ACTION_SEQ_LEN = 150
-MAX_INPUT_SEQ_LEN = 100
 
 
 @functools.total_ordering
@@ -142,11 +141,7 @@ class Transducer(torch.nn.Module):
                 alignment_update[i] = 1
         self.alignment_update = torch.tensor(alignment_update, device=self.device)
 
-        # lookup for valid actions (given length of encoder suffix)
-        self.valid_actions_lookup = torch.stack(
-            [self.compute_valid_actions(i)
-             for i in range(MAX_INPUT_SEQ_LEN)],
-            dim=0).unsqueeze(dim=0)
+        self.valid_actions_lookup: Dict[int, torch.tensor] = {}
 
     @property
     def h0_c0(self):
@@ -171,8 +166,6 @@ class Transducer(torch.nn.Module):
         Returns:
             The corresponding embeddings.
             """
-        if input_.dim() == 1:
-            input_tensor = input_.unsqueeze(dim=0)
         emb = self.char_lookup(input_)
 
         if not is_training:
@@ -228,6 +221,15 @@ class Transducer(torch.nn.Module):
             valid_actions[[COPY, DELETE]] = True
             valid_actions[self.substitutions] = True
         return valid_actions
+
+    def valid_actions_for_suffixes(self, suffix_lengths: torch.tensor) -> torch.tensor:
+        masks = []
+        for length in suffix_lengths.detach().cpu().reshape(-1).tolist():
+            length = max(int(length), 0)
+            if length not in self.valid_actions_lookup:
+                self.valid_actions_lookup[length] = self.compute_valid_actions(length)
+            masks.append(self.valid_actions_lookup[length])
+        return torch.stack(masks, dim=0).unsqueeze(dim=0)
 
     @staticmethod
     def sample(log_probs: np.array) -> int:
@@ -507,7 +509,7 @@ class Transducer(torch.nn.Module):
             return torch.any(action_history == END_WORD, dim=2).sum() < batch_size
 
         while continue_decoding() and action_history.size(2) <= MAX_ACTION_SEQ_LEN:
-            valid_actions_mask = self.valid_actions_lookup[:, true_input_lengths - alignment]
+            valid_actions_mask = self.valid_actions_for_suffixes(true_input_lengths - alignment)
 
             # run decoder
             decoder_output, decoder = self.decoder_step(
@@ -518,7 +520,7 @@ class Transducer(torch.nn.Module):
             actions, log_probs = self.calculate_actions(decoder_output, valid_actions_mask)
 
             # update states
-            log_p += log_probs[:, torch.arange(batch_size), actions.squeeze(dim=0)]
+            log_p += log_probs[:, torch.arange(batch_size, device=self.device), actions.squeeze(dim=0)]
             action_history = torch.cat(
                 (action_history, actions.unsqueeze(dim=2)),
                 dim=2
@@ -534,7 +536,7 @@ class Transducer(torch.nn.Module):
         # --> first element is not considered (begin-of-sequence-token)
         # --> and only token up to the first end-of-sequence-token (including it)
         action_history = [seq[1:(seq.index(EndOfSequence()) + 1 if EndOfSequence() in seq else -1)]
-                          for seq in action_history.squeeze(dim=0).tolist()]
+                          for seq in action_history.squeeze(dim=0).cpu().tolist()]
 
         return Output(action_history, self.decode_encoded_output(input_, action_history),
                       log_p, None)
@@ -641,7 +643,7 @@ class Transducer(torch.nn.Module):
             for hypothesis in beam:
 
                 length_encoder_suffix = max(input_length - hypothesis.alignment, torch.tensor([0], device=self.device))
-                valid_actions_mask = self.valid_actions_lookup[:, length_encoder_suffix]
+                valid_actions_mask = self.valid_actions_for_suffixes(length_encoder_suffix)
                 # decoder
                 decoder_output, decoder = self.decoder_step(bidirectional_emb,
                                                             feature_emb,
@@ -663,7 +665,7 @@ class Transducer(torch.nn.Module):
 
             beam: List[Hypothesis] = []
 
-            for _ in range(beam_width):
+            for _ in range(min(beam_width, len(expansions))):
 
                 expansion: Expansion = heapq.heappop(expansions)
                 from_hypothesis = expansion.from_hypothesis
@@ -680,7 +682,7 @@ class Transducer(torch.nn.Module):
                 if isinstance(action, EndOfSequence):
                     # 1. COMPLETE HYPOTHESIS, REDUCE BEAM
                     complete_hypothesis = Output(
-                        action_history=action_history.squeeze(dim=1).tolist()[1:],
+                        action_history=action_history.squeeze(dim=1).cpu().tolist()[1:],
                         output="".join(output),
                         log_p=-expansion.negative_log_p.item())  # undo min heap minus
 
@@ -710,7 +712,7 @@ class Transducer(torch.nn.Module):
             for hypothesis in beam:
 
                 complete_hypothesis = Output(
-                    action_history=hypothesis.action_history.squeeze(dim=1).tolist()[1:],
+                    action_history=hypothesis.action_history.squeeze(dim=1).cpu().tolist()[1:],
                     output="".join(hypothesis.output),
                     log_p=-hypothesis.negative_log_p.item())  # undo min heap minus
 

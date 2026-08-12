@@ -23,6 +23,22 @@ class Sample:
     features: Optional[str] = None
     encoded_features: Optional[torch.tensor] = None
 
+    _tensor_attrs = (
+        "encoded_input",
+        "action_history",
+        "alignment_history",
+        "optimal_actions_mask",
+        "valid_actions_mask",
+        "encoded_features",
+    )
+
+    def to(self, device: str = 'cpu') -> "Sample":
+        for attr in self._tensor_attrs:
+            attr_val = getattr(self, attr)
+            if torch.is_tensor(attr_val):
+                setattr(self, attr, attr_val.to(device))
+        return self
+
 
 @dataclasses.dataclass
 class TrainingBatch:
@@ -114,11 +130,7 @@ class Dataset(torch.utils.data.Dataset):
 
     def to(self, device: str = 'cpu'):
         for s in self.samples:
-            for attr in ['encoded_input', 'action_history', 'alignment_history',
-                         'optimal_actions_mask', 'valid_actions_mask']:
-                attr_val = getattr(s, attr)
-                if torch.is_tensor(attr_val):
-                    setattr(s, attr, attr_val.to(device))
+            s.to(device)
 
     def persist(self, filename: str):
         with open(filename, mode="wb") as w:

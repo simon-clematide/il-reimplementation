@@ -33,7 +33,7 @@ class TestOptimalExpert(unittest.TestCase):
              [1, 0, 1, 2, 3, 4, 5],
              [2, 1, 0, 1, 2, 3, 4],
              [3, 2, 1, 1, 2, 3, 3]],
-            dtype=np.float_
+            dtype=np.float64
         )
         self.assertTrue(np.allclose(
             expected_prefix_matrix,

@@ -52,6 +52,29 @@ class TransducerTests(unittest.TestCase):
         valid_actions = self.transducer.compute_valid_actions(1)
         self.assertTrue(not valid_actions[vocabulary.COPY])
 
+    def test_valid_actions_for_suffixes_is_dynamic(self):
+        suffix_lengths = torch.tensor([0, 1, 99, 100, 250])
+
+        valid_actions = self.transducer.valid_actions_for_suffixes(suffix_lengths)
+
+        self.assertEqual(
+            (1, len(suffix_lengths), self.transducer.number_actions),
+            tuple(valid_actions.shape),
+        )
+        self.assertFalse(valid_actions[0, 0, vocabulary.COPY])
+        self.assertFalse(valid_actions[0, 1, vocabulary.COPY])
+        self.assertTrue(valid_actions[0, 2, vocabulary.COPY])
+        self.assertTrue(valid_actions[0, 3, vocabulary.COPY])
+        self.assertTrue(valid_actions[0, 4, vocabulary.COPY])
+
+    @unittest.skipUnless(torch.backends.mps.is_available(), "MPS is not available")
+    def test_valid_actions_for_suffixes_accepts_mps_lengths(self):
+        suffix_lengths = torch.tensor([0, 1, 100], device="mps")
+
+        valid_actions = self.transducer.valid_actions_for_suffixes(suffix_lengths)
+
+        self.assertEqual(torch.device("cpu"), valid_actions.device)
+
     def test_remap_actions(self):
         action_scores = {Copy("w", "w"): 7., Sub("w", "v"): 5.}
         expected = {ConditionalCopy(): 7., ConditionalSub("v"): 5.}

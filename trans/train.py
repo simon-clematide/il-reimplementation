@@ -1,8 +1,10 @@
 """Trains a grapheme-to-phoneme neural transducer."""
 import argparse
+import json
 import logging
 import os
 import random
+import subprocess
 import sys
 
 import progressbar
@@ -18,6 +20,47 @@ from trans import vocabulary
 from trans import ENCODER_MAPPING, OPTIMIZER_MAPPING, LR_SCHEDULER_MAPPING
 
 random.seed(1)
+
+
+def accumulation_loss_scale(batch_index: int, batch_count: int,
+                            accumulation: int) -> int:
+    if accumulation < 1:
+        raise ValueError("Gradient accumulation must be at least 1.")
+    group_start = batch_index - (batch_index % accumulation)
+    return min(accumulation, batch_count - group_start)
+
+
+def should_step(batch_index: int, batch_count: int, accumulation: int) -> bool:
+    if accumulation < 1:
+        raise ValueError("Gradient accumulation must be at least 1.")
+    is_accumulated_batch = (batch_index + 1) % accumulation == 0
+    is_final_batch = batch_index + 1 == batch_count
+    return is_accumulated_batch or is_final_batch
+
+
+def current_git_commit() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+def write_checkpoint_metadata(path: str, args: argparse.Namespace,
+                              epoch: int, dev_accuracy: float,
+                              train_accuracy: float) -> None:
+    metadata = {
+        "epoch": epoch,
+        "dev_accuracy": dev_accuracy,
+        "train_accuracy": train_accuracy,
+        "git_commit": current_git_commit(),
+        "args": vars(args),
+    }
+    with open(path, "w") as w:
+        json.dump(metadata, w, indent=2, sort_keys=True)
 
 
 def decode(transducer_: transducer.Transducer, data_loader: torch.utils.data.DataLoader,
@@ -294,6 +337,7 @@ def main(args: argparse.Namespace):
 
     train_log_path = os.path.join(args.output, "train.log")
     best_model_path = os.path.join(args.output, "best.model")
+    best_model_metadata_path = os.path.join(args.output, "best.model.json")
 
     with open(train_log_path, "w") as w:
         w.write("epoch\tavg_loss\ttrain_accuracy\tdev_accuracy\n")
@@ -318,7 +362,7 @@ def main(args: argparse.Namespace):
     logging.info("Number of train batches: %d.", len(training_data_loader))
 
     best_train_accuracy = 0
-    best_dev_accuracy = 0
+    best_dev_accuracy = -float("inf")
     best_epoch = 0
     patience = 0
 
@@ -326,12 +370,13 @@ def main(args: argparse.Namespace):
 
         logging.info("Training...")
         transducer_.train()
-        transducer_.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         with utils.Timer():
             train_loss = 0.
             # rollin not implemented at the moment
             # rollin = rollin_schedule(epoch)
             j = 0
+            batch_count = len(training_data_loader)
             for j, batch in enumerate(training_data_loader):
                 losses = transducer_.training_step(encoded_input=batch.encoded_input,
                                                    encoded_features=batch.encoded_features,
@@ -340,13 +385,14 @@ def main(args: argparse.Namespace):
                                                    optimal_actions_mask=batch.optimal_actions_mask,
                                                    valid_actions_mask=batch.valid_actions_mask)
                 train_loss += torch.mean(losses.squeeze(dim=0)).item()  # mean per batch
-                reduced_loss = reduce_loss(losses) / args.grad_accumulation
+                scale = accumulation_loss_scale(j, batch_count, args.grad_accumulation)
+                reduced_loss = reduce_loss(losses) / scale
                 reduced_loss.backward()
-                if j % args.grad_accumulation == 0:
+                if should_step(j, batch_count, args.grad_accumulation):
                     optimizer.step()
                     if scheduler is not None and scheduler.type == 'step':
                         scheduler.step()
-                    transducer_.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
                 if j > 0 and j % 100 == 0:
                     logging.info("\t\t...%d batches", j)
             logging.info("\t\t...%d batches", j + 1)
@@ -381,6 +427,13 @@ def main(args: argparse.Namespace):
             patience = 0
             logging.info("Found best dev accuracy %.4f.", best_dev_accuracy)
             torch.save(transducer_.state_dict(), best_model_path)
+            write_checkpoint_metadata(
+                best_model_metadata_path,
+                args,
+                epoch,
+                dev_accuracy,
+                train_accuracy,
+            )
             logging.info("Saved new best model to %s.", best_model_path)
 
         logging.info(
@@ -404,11 +457,13 @@ def main(args: argparse.Namespace):
 
     logging.info("Finished training.")
 
+    if args.epochs < 1:
+        raise ValueError("At least one epoch is required to produce a model checkpoint.")
     if not os.path.exists(best_model_path):
-        sys.exit(0)
+        raise RuntimeError(f"No model checkpoint was written to {best_model_path}.")
 
     transducer_ = transducer.Transducer(vocabulary_, expert, args)
-    transducer_.load_state_dict(torch.load(best_model_path))
+    transducer_.load_state_dict(torch.load(best_model_path, map_location=args.device))
 
     transducer_.eval()
     with torch.no_grad():
