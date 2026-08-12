@@ -97,6 +97,27 @@ The command used in the notebook-style workflow is:
   --device mps
 ```
 
+By default this project uses damped EM for SED fitting:
+
+```text
+--sed-em-mode damped --sed-em-damping 0.9
+```
+
+This computes the strict EM estimate, then interpolates in probability space
+with the previous parameters. With damping `0.9`, the update moves 90% toward
+the strict EM estimate and keeps 10% of the previous distribution. This is
+useful for sparse transduction data because rare operations do not collapse to
+zero as aggressively.
+
+For paper-faithful Ristad-Yianilos EM, use:
+
+```bash
+--sed-em-mode strict
+```
+
+Strict EM initializes expected counts to log-zero at each iteration and
+normalizes only the expected counts accumulated by the E-step.
+
 The useful artifact is:
 
 ```text

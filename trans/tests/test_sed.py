@@ -184,6 +184,79 @@ class TestTransducer(unittest.TestCase):
         after_ll = sed_.log_likelihood(sources, targets)
         self.assertTrue(before_ll <= after_ll)
 
+    def test_strict_m_step_uses_normalized_expected_counts(self):
+        params = sed.ParamDict(
+            delta_sub={("a", "b"): np.log(0.25)},
+            delta_del={"a": np.log(0.25)},
+            delta_ins={"b": np.log(0.25)},
+            delta_eos=np.log(0.25),
+        )
+        sed_ = sed.StochasticEditDistance(params)
+        gammas = sed.ParamDict(
+            delta_sub={("a", "b"): np.log(2.)},
+            delta_del={"a": np.log(1.)},
+            delta_ins={"b": np.log(1.)},
+            delta_eos=np.log(2.),
+        )
+
+        sed_.m_step(gammas, damping=1.)
+
+        self.assertTrue(np.isclose(np.exp(sed_.delta_sub[("a", "b")]), 2 / 6))
+        self.assertTrue(np.isclose(np.exp(sed_.delta_del["a"]), 1 / 6))
+        self.assertTrue(np.isclose(np.exp(sed_.delta_ins["b"]), 1 / 6))
+        self.assertTrue(np.isclose(np.exp(sed_.delta_eos), 2 / 6))
+
+    def test_damped_m_step_interpolates_in_probability_space(self):
+        params = sed.ParamDict(
+            delta_sub={("a", "b"): np.log(0.25)},
+            delta_del={"a": np.log(0.25)},
+            delta_ins={"b": np.log(0.25)},
+            delta_eos=np.log(0.25),
+        )
+        sed_ = sed.StochasticEditDistance(params)
+        gammas = sed.ParamDict(
+            delta_sub={("a", "b"): np.log(2.)},
+            delta_del={"a": np.log(1.)},
+            delta_ins={"b": np.log(1.)},
+            delta_eos=np.log(2.),
+        )
+
+        sed_.m_step(gammas, damping=0.5)
+
+        self.assertTrue(np.isclose(
+            np.exp(sed_.delta_sub[("a", "b")]),
+            0.5 * (2 / 6) + 0.5 * 0.25,
+        ))
+        self.assertTrue(np.isclose(
+            np.exp(sed_.delta_del["a"]),
+            0.5 * (1 / 6) + 0.5 * 0.25,
+        ))
+        self.assertTrue(np.isclose(0., sed_.params.sum()))
+
+    def test_m_step_rejects_zero_expected_count(self):
+        params = sed.ParamDict(
+            delta_sub={("a", "b"): np.log(0.25)},
+            delta_del={"a": np.log(0.25)},
+            delta_ins={"b": np.log(0.25)},
+            delta_eos=np.log(0.25),
+        )
+        sed_ = sed.StochasticEditDistance(params)
+        empty_gammas = sed.ParamDict.zeros_like(params)
+
+        with self.assertRaisesRegex(ValueError, "zero expected count"):
+            sed_.m_step(empty_gammas)
+
+        self.assertTrue(np.isclose(0., sed_.params.sum()))
+        self.assertTrue(np.isfinite(sed_.delta_eos))
+
+    def test_em_mode_and_damping_are_validated(self):
+        sed_ = sed.StochasticEditDistance.build_sed("a", "b", copy_probability=None)
+
+        with self.assertRaises(ValueError):
+            sed_.em(["a"], ["b"], iterations=1, mode="unknown")
+        with self.assertRaises(ValueError):
+            sed_.em(["a"], ["b"], iterations=1, damping=0.)
+
     def test_fit_from_data(self):
 
         input_lines = [

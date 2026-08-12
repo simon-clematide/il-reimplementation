@@ -38,6 +38,13 @@ class ParamDict:
                    delta_ins=dict(other.delta_ins),
                    delta_eos=other.delta_eos)
 
+    @classmethod
+    def zeros_like(cls, other: "ParamDict"):
+        return cls(delta_sub={k: LOG_ZERO for k in other.delta_sub},
+                   delta_del={k: LOG_ZERO for k in other.delta_del},
+                   delta_ins={k: LOG_ZERO for k in other.delta_ins},
+                   delta_eos=LOG_ZERO)
+
 
 class StochasticEditDistance(actions.Aligner):
     """Implementation of the Stochastic Edit Distance (SED) model from
@@ -108,7 +115,9 @@ class StochasticEditDistance(actions.Aligner):
     def fit_from_data(cls, lines: Iterable[utils.Sample],
                       copy_probability: float = None,
                       em_iterations: int = 30,
-                      output_path: str = None):
+                      output_path: str = None,
+                      em_mode: str = "damped",
+                      em_damping: float = 0.9):
 
         source_alphabet = set()
         target_alphabet = set()
@@ -124,7 +133,8 @@ class StochasticEditDistance(actions.Aligner):
 
         sed = cls.build_sed(source_alphabet, target_alphabet, copy_probability)
         sed.update_model(sources, targets, iterations=em_iterations,
-                         output_path=output_path)
+                         output_path=output_path, em_mode=em_mode,
+                         em_damping=em_damping)
         return sed
 
     @classmethod
@@ -217,23 +227,34 @@ class StochasticEditDistance(actions.Aligner):
         return float(ll)
 
     def em(self, sources: Sequence[Any], targets: Sequence[Any],
-           iterations: int = 10) -> None:
+           iterations: int = 10, mode: str = "damped",
+           damping: float = 0.9) -> None:
         """Update parameters using Expectation-Maximization.
 
         Args:
             sources: Source strings.
             targets: Target strings.
-            iterations: Number of iterations of EM."""
+            iterations: Number of iterations of EM.
+            mode: ``strict`` for paper-faithful EM or ``damped`` for
+                probability-space interpolation with the previous parameters.
+            damping: Interpolation weight for the strict EM estimate when
+                ``mode`` is ``damped``."""
+        if mode not in {"strict", "damped"}:
+            raise ValueError(f"Unknown EM mode: {mode}.")
+        if not 0. < damping <= 1.:
+            raise ValueError(f"EM damping must satisfy 0 < damping <= 1: {damping}.")
+        effective_damping = damping if mode == "damped" else 1.
         logging.info(
             "Initial weighted LL=%.4f", self.log_likelihood(sources, targets))
+        logging.info("SED EM mode=%s damping=%.4f", mode, effective_damping)
 
         for i in range(iterations):
-            gammas = ParamDict.from_params(self.params)
+            gammas = ParamDict.zeros_like(self.params)
             for j, (source, target) in enumerate(zip(sources, targets)):
                 self.e_step(source, target, gammas)
                 if j > 0 and j % 1000 == 0:
                     logging.info("\t...processed %d samples", j)
-            self.m_step(gammas)
+            self.m_step(gammas, damping=effective_damping)
             logging.info("IT_%d=%.4f", i, self.log_likelihood(sources, targets))
 
     def e_step(self, source: Sequence[Any], target: Sequence[Any],
@@ -267,13 +288,52 @@ class StochasticEditDistance(actions.Aligner):
                         [gammas.delta_sub[stpair],
                          alpha[t - 1, v - 1] + self.delta_sub[stpair] + rest])
 
-    def m_step(self, gammas: ParamDict) -> None:
+    @staticmethod
+    def interpolate_log_probabilities(old_value: float, em_value: float,
+                                      damping: float) -> float:
+        return np.logaddexp(
+            np.log(damping) + em_value,
+            np.log1p(-damping) + old_value,
+        )
+
+    @classmethod
+    def damp_parameters(cls, old_params: ParamDict, em_params: ParamDict,
+                        damping: float) -> ParamDict:
+        return ParamDict(
+            delta_sub={
+                k: cls.interpolate_log_probabilities(
+                    old_params.delta_sub[k], em_params.delta_sub[k], damping)
+                for k in em_params.delta_sub
+            },
+            delta_del={
+                k: cls.interpolate_log_probabilities(
+                    old_params.delta_del[k], em_params.delta_del[k], damping)
+                for k in em_params.delta_del
+            },
+            delta_ins={
+                k: cls.interpolate_log_probabilities(
+                    old_params.delta_ins[k], em_params.delta_ins[k], damping)
+                for k in em_params.delta_ins
+            },
+            delta_eos=cls.interpolate_log_probabilities(
+                old_params.delta_eos, em_params.delta_eos, damping),
+        )
+
+    def m_step(self, gammas: ParamDict, damping: float = 1.) -> None:
         """Normalizes weights and stores them."""
+        if not 0. < damping <= 1.:
+            raise ValueError(f"EM damping must satisfy 0 < damping <= 1: {damping}.")
+        old_params = ParamDict.from_params(self.params)
         denom = gammas.sum()
+        if np.isneginf(denom):
+            raise ValueError("Cannot perform SED M-step with zero expected count.")
         gammas.delta_sub = {k: (v - denom) for k, v in gammas.delta_sub.items()}
         gammas.delta_del = {k: (v - denom) for k, v in gammas.delta_del.items()}
         gammas.delta_ins = {k: (v - denom) for k, v in gammas.delta_ins.items()}
         gammas.delta_eos -= denom
+
+        if damping < 1.:
+            gammas = self.damp_parameters(old_params, gammas, damping)
 
         assert np.isclose(0., gammas.sum()), gammas.sum()
         self.params = gammas
@@ -372,6 +432,8 @@ class StochasticEditDistance(actions.Aligner):
                      targets: Sequence[Iterable[Any]],
                      iterations: int = 10,
                      output_path: Optional[str] = None,
+                     em_mode: str = "damped",
+                     em_damping: float = 0.9,
                      **kwargs) -> None:
         """Update weights by maximizing likelihood by Expectation-Maximization.
 
@@ -382,7 +444,8 @@ class StochasticEditDistance(actions.Aligner):
             output_path: Path where to write learned weights."""
         logging.info("Updating model parameters by maximizing likelihood using "
                      "EM (%d iterations).", iterations)
-        self.em(sources, targets, iterations)
+        self.em(sources, targets, iterations, mode=em_mode,
+                damping=em_damping)
 
         if output_path is not None:
             self.to_pickle(output_path)

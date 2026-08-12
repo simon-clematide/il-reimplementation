@@ -64,6 +64,13 @@ The most important (and required) parameters are:
 
 For a full list of available training configurations, use ``trans-train --help``.
 
+SED parameters are estimated during training unless ``--sed-params`` points to
+an existing ``sed.pkl`` file. The default SED estimator is damped EM:
+
+        --sed-em-mode damped --sed-em-damping 0.9
+
+Use ``--sed-em-mode strict`` for the paper-faithful Ristad-Yianilos EM update.
+
 ### Ensembling
 To ensemble a number of models based on majority voting, run the python script 
 ``ensembling.py`` via ``python ensembling.py`` or use the cli entry point 
