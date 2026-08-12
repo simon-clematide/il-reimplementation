@@ -38,6 +38,12 @@ def should_step(batch_index: int, batch_count: int, accumulation: int) -> bool:
     return is_accumulated_batch or is_final_batch
 
 
+def should_stop_for_patience(patience: int, max_patience: int) -> bool:
+    if max_patience < 1:
+        raise ValueError("Patience must be at least 1.")
+    return patience >= max_patience
+
+
 def current_git_commit() -> str:
     try:
         return subprocess.check_output(
@@ -441,14 +447,14 @@ def main(args: argparse.Namespace):
             f"dev loss: {avg_dev_loss:.4f} train acc: {train_accuracy:.4f} "
             f"dev acc: {dev_accuracy:.4f} best train acc: {best_train_accuracy:.4f} "
             f"best dev acc: {best_dev_accuracy:.4f} best epoch: {best_epoch} "
-            f"patience: {patience} / {max_patience - 1}"
+            f"patience: {patience} / {max_patience}"
         )
 
         log_line = f"{epoch}\t{avg_loss:.4f}\t{train_accuracy:.4f}\t{dev_accuracy:.4f}\n"
         with open(train_log_path, "a") as a:
             a.write(log_line)
 
-        if patience == max_patience:
+        if should_stop_for_patience(patience, max_patience):
             logging.info("Out of patience after %d epochs.", epoch + 1)
             train_progress_bar.finish()
             break

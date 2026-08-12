@@ -1,6 +1,7 @@
 """Optimizer classes and lr scheduler used in training."""
 
 import argparse
+import inspect
 from trans import register_component
 
 import torch
@@ -101,18 +102,23 @@ class ReduceLROnPlateau(torch.optim.lr_scheduler.ReduceLROnPlateau):
     """Scheduler for reducing learning rate on plateau."""
     def __init__(self, optimizer: torch.optim, args: argparse.Namespace):
         self.type = 'metric'
-        super().__init__(
-            optimizer=optimizer,
-            mode='max',
-            factor=args.factor,
-            patience=args.lrs_patience,
-            threshold=args.threshold,
-            threshold_mode=args.threshold_mode,
-            cooldown=args.cooldown,
-            min_lr=args.min_lr,
-            eps=args.lrs_eps,
-            verbose=args.verbose
-        )
+        kwargs = {
+            "optimizer": optimizer,
+            "mode": 'max',
+            "factor": args.factor,
+            "patience": args.lrs_patience,
+            "threshold": args.threshold,
+            "threshold_mode": args.threshold_mode,
+            "cooldown": args.cooldown,
+            "min_lr": args.min_lr,
+            "eps": args.lrs_eps,
+            "verbose": args.verbose,
+        }
+        supported = inspect.signature(
+            torch.optim.lr_scheduler.ReduceLROnPlateau.__init__
+        ).parameters
+        kwargs = {k: v for k, v in kwargs.items() if k in supported}
+        super().__init__(**kwargs)
 
     @staticmethod
     def add_args(parser: argparse.ArgumentParser) -> None:

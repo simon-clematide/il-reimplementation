@@ -60,6 +60,16 @@ class TestGradientAccumulation(unittest.TestCase):
         self.assertEqual({"device": "cpu", "epochs": 1}, metadata["args"])
         self.assertIn("git_commit", metadata)
 
+    def test_should_stop_for_patience(self):
+        self.assertFalse(train.should_stop_for_patience(0, 2))
+        self.assertFalse(train.should_stop_for_patience(1, 2))
+        self.assertTrue(train.should_stop_for_patience(2, 2))
+        self.assertTrue(train.should_stop_for_patience(3, 2))
+
+    def test_invalid_patience_is_rejected(self):
+        with self.assertRaises(ValueError):
+            train.should_stop_for_patience(0, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
