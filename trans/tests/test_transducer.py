@@ -75,6 +75,22 @@ class TransducerTests(unittest.TestCase):
 
         self.assertEqual(torch.device("cpu"), valid_actions.device)
 
+    def test_encoded_action_history_trims_at_end_word(self):
+        encoded_history = torch.tensor([[
+            [vocabulary.BEGIN_WORD, 10, vocabulary.END_WORD, 11],
+            [vocabulary.BEGIN_WORD, 12, 13, vocabulary.END_WORD],
+        ]])
+
+        action_history = [
+            seq[1:(seq.index(vocabulary.END_WORD) + 1 if vocabulary.END_WORD in seq else -1)]
+            for seq in encoded_history.squeeze(dim=0).cpu().tolist()
+        ]
+
+        self.assertEqual(
+            [[10, vocabulary.END_WORD], [12, 13, vocabulary.END_WORD]],
+            action_history,
+        )
+
     def test_remap_actions(self):
         action_scores = {Copy("w", "w"): 7., Sub("w", "v"): 5.}
         expected = {ConditionalCopy(): 7., ConditionalSub("v"): 5.}
