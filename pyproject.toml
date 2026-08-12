@@ -31,3 +31,4 @@ packages = ["trans"]
 trans-train = "trans.train:cli_main"
 trans-ensemble = "trans.ensembling:cli_main"
 trans-grid-search = "trans.grid_search:cli_main"
+trans-analyze-sed = "trans.analyze_sed:cli_main"

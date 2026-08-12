@@ -393,6 +393,53 @@ insertion if target material is still missing.
 - [trans/utils.py](/Users/siclemat/pj/2023/il-reimplementation/trans/utils.py):
   `Sample`, `Dataset`, batching, and tensor device transfer.
 
+## SED as a dataset diagnostic
+
+A fitted SED model can also score how surprising each source-target pair is.
+The command-line tool is:
+
+```bash
+trans-analyze-sed \
+  --sed-params data.d/sed-2021/low_ita/sed.pkl \
+  --input data.d/sigmorphon2021/low/ita_train.tsv \
+  --output data.d/ita_train_sed_analysis.tsv
+```
+
+It writes a ranked TSV table containing:
+
+```text
+stochastic_surprisal      -log P(source,target), summed over alignments
+max_length_surprisal      stochastic surprisal / max(source length, target length)
+target_length_surprisal   stochastic surprisal / target length
+viterbi_surprisal         -log P(best alignment, source,target)
+alignment_ambiguity       log P(total) - log P(best alignment)
+alignment                 readable Viterbi alignment
+```
+
+Useful rankings:
+
+```bash
+# Most surprising examples per output symbol.
+trans-analyze-sed \
+  --sed-params data.d/sed-2021/low_ita/sed.pkl \
+  --input data.d/sigmorphon2021/low/ita_train.tsv \
+  --sort-by target_length_surprisal \
+  --limit 50
+
+# Examples with many plausible alignments.
+trans-analyze-sed \
+  --sed-params data.d/sed-2021/low_ita/sed.pkl \
+  --input data.d/sigmorphon2021/low/ita_train.tsv \
+  --sort-by alignment_ambiguity \
+  --limit 50
+```
+
+Raw surprisal tends to rank long examples highly, so normalized columns are
+usually more useful for data cleaning. For principled anomaly detection, score
+held-out examples with a SED model fitted on other data; scoring the same data
+used to fit SED is still useful for exploratory inspection, but unusual examples
+can partly teach the model their own edit behavior.
+
 ## Mental model
 
 The cleanest way to understand this project is:
