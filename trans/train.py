@@ -313,7 +313,8 @@ def main(args: argparse.Namespace):
         sed_parameters_path = os.path.join(args.output, "sed.pkl")
         sed_aligner = sed.StochasticEditDistance.fit_from_data(
             training_data.samples, em_iterations=args.sed_em_iterations,
-            output_path=sed_parameters_path)
+            output_path=sed_parameters_path, em_mode=args.sed_em_mode,
+            em_damping=args.sed_em_damping)
     expert = optimal_expert_substitutions.OptimalSubstitutionExpert(sed_aligner)
 
     transducer_ = transducer.Transducer(vocabulary_, expert, args)
@@ -565,6 +566,11 @@ def cli_main():
                         help="Scheduler used in training.")
     parser.add_argument("--sed-em-iterations", type=int, default=10,
                         help="SED EM iterations.")
+    parser.add_argument("--sed-em-mode", choices=["strict", "damped"],
+                        default="damped",
+                        help="SED EM estimator. strict is paper-faithful; damped interpolates with previous parameters.")
+    parser.add_argument("--sed-em-damping", type=float, default=0.9,
+                        help="Weight of the strict EM estimate when --sed-em-mode=damped. Must satisfy 0 < x <= 1.")
     parser.add_argument("--sed-params", type=str,
                         help="Path to learned SED parameters.")
     parser.add_argument("--device", type=str, default='cpu',
