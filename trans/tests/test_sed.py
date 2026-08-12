@@ -50,13 +50,68 @@ class TestTransducer(unittest.TestCase):
         best_edits, distance = self.smart_sed.viterbi_distance(
             source="affa", target="iffig", with_alignment=True)
 
-        expected_edits = [
-            Sub(old='a', new='i'), Sub(old='f', new='f'), Sub(old='f', new='f'),
-            Ins(new='i'), Sub(old='a', new='g')
-        ]
-
         self.assertTrue(np.isclose(-26.7633, distance))
-        self.assertListEqual(expected_edits, best_edits)
+        self.assertEqual("iffig", self.replay("affa", best_edits))
+        self.assertTrue(np.isclose(
+            self.smart_sed.alignment_log_probability(best_edits),
+            distance,
+        ))
+
+    def test_viterbi_traceback_uses_transition_weights(self):
+        params = sed.ParamDict(
+            delta_sub={("a", "b"): np.log(0.01)},
+            delta_del={"a": np.log(0.40)},
+            delta_ins={"b": np.log(0.40)},
+            delta_eos=np.log(0.19),
+        )
+        sed_ = sed.StochasticEditDistance(params)
+
+        alignment, score = sed_.viterbi_distance(
+            "a", "b", with_alignment=True)
+
+        self.assertEqual(2, len(alignment))
+        self.assertTrue(any(isinstance(action, Del) for action in alignment))
+        self.assertTrue(any(isinstance(action, Ins) for action in alignment))
+        self.assertTrue(np.isclose(
+            np.log(0.40) + np.log(0.40) + np.log(0.19),
+            score,
+        ))
+        self.assertTrue(np.isclose(
+            sed_.alignment_log_probability(alignment),
+            score,
+        ))
+
+    def test_viterbi_alignment_score_consistency(self):
+        pairs = [
+            ("", ""),
+            ("a", ""),
+            ("", "f"),
+            ("a", "f"),
+            ("affa", "iffig"),
+            ("abc", "fgh"),
+        ]
+        for source, target in pairs:
+            with self.subTest(source=source, target=target):
+                alignment, score = self.smart_sed.viterbi_distance(
+                    source, target, with_alignment=True)
+                self.assertTrue(np.isclose(
+                    self.smart_sed.alignment_log_probability(alignment),
+                    score,
+                ))
+
+    def test_forward_backward_eos_invariant(self):
+        pairs = [
+            ("", ""),
+            ("a", ""),
+            ("", "f"),
+            ("a", "f"),
+            ("abc", "fgh"),
+        ]
+        for source, target in pairs:
+            with self.subTest(source=source, target=target):
+                alpha = self.smart_sed.forward_evaluate(source, target)
+                beta = self.smart_sed.backward_evaluate(source, target)
+                self.assertTrue(np.isclose(alpha[-1, -1], beta[0, 0]))
 
     @staticmethod
     def replay(source, alignment):
@@ -64,9 +119,11 @@ class TestTransducer(unittest.TestCase):
         source_index = 0
         for action in alignment:
             if isinstance(action, Sub):
+                assert action.old == source[source_index]
                 source_index += 1
                 output.append(action.new)
             elif isinstance(action, Del):
+                assert action.old == source[source_index]
                 source_index += 1
             elif isinstance(action, Ins):
                 output.append(action.new)
