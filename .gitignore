@@ -2,9 +2,11 @@
 .idea/
 
 __pycache__/
+.venv/
 
 # specifically for macOS
 .DS_Store
 
 # packaging
 *.egg
+*.egg-info/

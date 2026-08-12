@@ -43,7 +43,7 @@ class TestSampleDeviceTransfer(unittest.TestCase):
 
         for attr in sample._tensor_attrs:
             with self.subTest(attr=attr):
-                self.assertEqual(torch.device("mps"), getattr(sample, attr).device)
+                self.assertEqual("mps", getattr(sample, attr).device.type)
 
 
 if __name__ == "__main__":
