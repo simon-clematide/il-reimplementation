@@ -21,31 +21,36 @@ We received some requests to share our models from our successful submission to 
 So if you want to use these models with this package, have a look at [this repository](https://github.com/slvnwhrl/sigmorphon2022-models) where we host the models.
 
 ## Installation
-Please make sure that you are using Python 3.7.
+Please make sure that you are using Python 3.13.
 To install this package, perform the following steps:
 
-* Clone the development branch and change to the package directory:
+* Clone the repository and change to the package directory:
 
-        git clone --single-branch -b development https://github.com/slvnwhrl/il-reimplementation.git neural_transducer
+        git clone https://github.com/slvnwhrl/il-reimplementation.git neural_transducer
         cd neural_transducer
 
-* Install the package:
+* Create and activate a Python 3.13 virtual environment:
+
+        python3.13 -m venv .venv
+        source .venv/bin/activate
+
+* Install the package and its runtime dependencies:
 
   * default installation
 
         pip install .
-  
-  * with cuda support
-        
-        pip install --cuda
 
   * local development (without the need to reinstall the package after changes):
 
         pip install -e .
 
+PyTorch is installed from the package metadata. For a CUDA-specific PyTorch build,
+install the appropriate PyTorch wheel for your platform first, following the
+official PyTorch selector, and then install this package.
+
 * Optionally, run unit tests:
 
-        python setup.py test
+        python -m unittest discover -s trans/tests -v
 
 ## Usage
 ### Training
@@ -77,7 +82,7 @@ To run grid search, run the python script ``grid_search.py`` via
 
 The following parameters are available:
 * ``--config`` path to the JSON config file (required)
-* ``--ouput`` path to the output directory (required)
+* ``--output`` path to the output directory (required)
 * ``--parallel-jobs`` number of jobs (i.e., trainings) that are run in parallel (on CPU and GPU)
 * ``--ensemble`` bool indicating whether to produce ensemble results or not
 

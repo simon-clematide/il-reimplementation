@@ -80,13 +80,14 @@ class StochasticEditDistance(actions.Aligner):
         n = (len(source_alphabet) * len(target_alphabet) +
              len(source_alphabet) + len(target_alphabet) + 1)
 
-        if copy_probability is None:
+        num_copy_edits = len(target_alphabet & source_alphabet)
+
+        if copy_probability is None or num_copy_edits == 0:
             uniform_weight = np.log(1 / n)
             log_copy_prob = uniform_weight  # probability of a copy action
             log_rest_prob = uniform_weight  # probability of any other action
         elif 0 < copy_probability < 1:
             # split copy mass over individual copy actions
-            num_copy_edits = len(target_alphabet & source_alphabet)
             num_rest = n - num_copy_edits
             log_copy_prob = np.log(copy_probability / num_copy_edits)
             log_rest_prob = np.log((1 - copy_probability) / num_rest)
@@ -243,18 +244,18 @@ class StochasticEditDistance(actions.Aligner):
         for t in range(T + 1):
             for v in range(V + 1):
                 rest = beta[t, v] - alpha[T, V]
-                schar = source[t - 1]
-                tchar = target[v - 1]
-                stpair = schar, tchar
-                if t > 0 and schar in gammas.delta_del:
+                if t > 0 and source[t - 1] in gammas.delta_del:
+                    schar = source[t - 1]
                     gammas.delta_del[schar] = logsumexp(
                         [gammas.delta_del[schar],
                          alpha[t - 1, v] + self.delta_del[schar] + rest])
-                if v > 0 and tchar in gammas.delta_ins:
+                if v > 0 and target[v - 1] in gammas.delta_ins:
+                    tchar = target[v - 1]
                     gammas.delta_ins[tchar] = logsumexp(
                         [gammas.delta_ins[tchar],
                          alpha[t, v - 1] + self.delta_ins[tchar] + rest])
-                if t > 0 and v > 0 and stpair in gammas.delta_sub:
+                if t > 0 and v > 0 and (source[t - 1], target[v - 1]) in gammas.delta_sub:
+                    stpair = source[t - 1], target[v - 1]
                     gammas.delta_sub[stpair] = logsumexp(
                         [gammas.delta_sub[stpair],
                          alpha[t - 1, v - 1] + self.delta_sub[stpair] + rest])
@@ -279,7 +280,7 @@ class StochasticEditDistance(actions.Aligner):
             Union[float, Tuple[List, float]]:
         """Computes Viterbi edit distance.
 
-        Viterbi edit distance \propto max_{edits} p(target, edit | source).
+        Viterbi edit distance \\propto max_{edits} p(target, edit | source).
 
         Args:
             source: Source string.
@@ -322,12 +323,12 @@ class StochasticEditDistance(actions.Aligner):
                 return alignment[::-1], optim_score
             if ind_w == 0:
                 # can only go left, i.e. via insertions
-                ind_c -= ind_c
+                ind_c -= 1
                 alignment.append(
                     Ins(target[ind_c]))  # minus 1 is due to offset
             elif ind_c == 0:
                 # can only go up, i.e. via deletions
-                ind_w -= ind_w
+                ind_w -= 1
                 alignment.append(
                     Del(source[ind_w]))  # minus 1 is due to offset
             else:
@@ -353,7 +354,7 @@ class StochasticEditDistance(actions.Aligner):
                             target: Sequence[Any]) -> float:
         """Computes stochastic edit distance.
 
-        Stochastic edit distance \propto sum_{edits} p(target, edit | source) =
+        Stochastic edit distance \\propto sum_{edits} p(target, edit | source) =
         p(target | source).
 
         Args:

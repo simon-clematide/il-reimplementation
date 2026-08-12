@@ -4,7 +4,7 @@ import unittest
 
 import numpy as np
 
-from trans.actions import Sub, Ins
+from trans.actions import Del, Sub, Ins
 from trans import sed
 from trans.tests import test_optimal_expert_substitutions
 
@@ -57,6 +57,44 @@ class TestTransducer(unittest.TestCase):
 
         self.assertTrue(np.isclose(-26.7633, distance))
         self.assertListEqual(expected_edits, best_edits)
+
+    @staticmethod
+    def replay(source, alignment):
+        output = []
+        source_index = 0
+        for action in alignment:
+            if isinstance(action, Sub):
+                source_index += 1
+                output.append(action.new)
+            elif isinstance(action, Del):
+                source_index += 1
+            elif isinstance(action, Ins):
+                output.append(action.new)
+            else:
+                raise AssertionError(f"Unexpected action: {action}")
+        assert source_index == len(source)
+        return "".join(output)
+
+    def test_viterbi_alignment_leading_insertions(self):
+        edits, _ = self.smart_sed.viterbi_distance(
+            source="", target="abc", with_alignment=True)
+
+        self.assertListEqual([Ins("a"), Ins("b"), Ins("c")], edits)
+        self.assertEqual("abc", self.replay("", edits))
+
+    def test_viterbi_alignment_leading_deletions(self):
+        edits, _ = self.smart_sed.viterbi_distance(
+            source="abc", target="", with_alignment=True)
+
+        self.assertListEqual([Del("a"), Del("b"), Del("c")], edits)
+        self.assertEqual("", self.replay("abc", edits))
+
+    def test_em_accepts_empty_source_and_target(self):
+        sed_ = sed.StochasticEditDistance.build_sed("abc", "xyz")
+
+        sed_.update_model(["", "abc"], ["xyz", ""], iterations=1)
+
+        self.assertTrue(np.isfinite(sed_.log_likelihood(["", "abc"], ["xyz", ""])))
 
     def test_stochastic_decoding(self):
 

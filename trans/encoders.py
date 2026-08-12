@@ -26,7 +26,7 @@ class LSTMEncoder(torch.nn.LSTM):
                             help="Encoder LSTM state dimension.")
         parser.add_argument("--enc-layers", type=int, default=1,
                             help="Number of encoder LSTM layers.")
-        parser.add_argument("--enc-bidirectional", type=bool, default=True,
+        parser.add_argument("--enc-bidirectional", action=argparse.BooleanOptionalAction, default=True,
                             help="If LSTM is bidirectional.")
         parser.add_argument("--enc-dropout", type=float, default=0.,
                             help="Dropout probability after each LSTM layer"
@@ -125,6 +125,8 @@ class SinusoidalPositionalEmbedding(torch.nn.Module):
 
     def forward(self, input):
         """Input is expected to be of size [bsz x seqlen]."""
+        if input.dim() != 2:
+            raise ValueError(f"Expected a batch-first 2D input, got shape {tuple(input.shape)}.")
         bsz, seq_len = input.shape
         max_pos = self.padding_idx + 1 + seq_len
         if self.weights is None or max_pos > self.weights.size(0):
@@ -137,10 +139,9 @@ class SinusoidalPositionalEmbedding(torch.nn.Module):
         self.weights = self.weights.to(self._float_tensor)
 
         mask = input.ne(self.padding_idx).long()
-        positions = torch.cumsum(mask, dim=0) * mask + self.padding_idx
+        positions = torch.cumsum(mask, dim=1) * mask + self.padding_idx
         return (
             self.weights.index_select(0, positions.view(-1))
             .view(bsz, seq_len, -1)
             .detach()
         )
-

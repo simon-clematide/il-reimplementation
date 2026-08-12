@@ -1,0 +1,6 @@
+Cython>=0.29
+torch>=2.6
+editdistance>=0.5.2
+numpy>=1.19
+progressbar>=2.5
+scipy>=1.5.4

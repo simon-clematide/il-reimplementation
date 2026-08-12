@@ -13,13 +13,13 @@ from typing import Any, Optional, List
 
 
 BASH_EXECUTABLE = shutil.which("bash")
+ACTIVE_PROCESSES = []
 
 
 def cleanup():
-    if 'process_list' in globals():
-        for p in process_list:
-            if p.poll() is None:
-                p.kill()
+    for p in ACTIVE_PROCESSES:
+        if p.poll() is None:
+            p.kill()
 
 
 atexit.register(cleanup)
@@ -41,13 +41,41 @@ def file_name_from_pattern(pattern: str, lang: str, split: str):
     return file_name
 
 
-def run_ensemble(gold: str, systems: List[str], output: str):
-    subprocess.Popen([
-        "trans-ensemble"
+def build_option_args(config: dict) -> List[str]:
+    parsed_args = []
+    for par_name, par_value in config.items():
+        if isinstance(par_value, bool):
+            if par_value:
+                parsed_args.append(f"--{par_name}")
+        elif isinstance(par_value, (list, tuple)):
+            parsed_args.extend([f"--{par_name}", *[str(v) for v in par_value]])
+        elif par_name in ['sed-params', 'precomputed-train', 'vocabulary']:
+            continue
+        else:
+            parsed_args.extend([f"--{par_name}", str(par_value)])
+    return parsed_args
+
+
+def build_train_command(extra_args: List[str]) -> List[str]:
+    return ["trans-train", *extra_args]
+
+
+def build_ensemble_command(gold: str, systems: List[str], output: str) -> List[str]:
+    return [
+        "trans-ensemble",
         "--gold", gold,
         "--systems", *systems,
-        "--output", output
-    ]).wait()
+        "--output", output,
+    ]
+
+
+def run_ensemble(gold: str, systems: List[str], output: str):
+    process = subprocess.Popen(build_ensemble_command(gold, systems, output))
+    return_code = process.wait()
+    if return_code != 0:
+        raise RuntimeError(
+            f"Ensemble command failed with return code {return_code}: "
+            f"{' '.join(build_ensemble_command(gold, systems, output))}")
 
 
 def write_to_results_file(results_file: str, results: List[dict], beam_width: Optional[str] = None):
@@ -68,102 +96,104 @@ def write_to_results_file(results_file: str, results: List[dict], beam_width: Op
 def main(args: argparse.Namespace):
     os.makedirs(args.output, exist_ok=True)
 
-    config_file = open(args.config)
-    config_dict = json.load(config_file)
+    with open(args.config) as config_file:
+        config_dict = json.load(config_file)
 
     process_list = []
-    for name, grid_config in config_dict["grids"].items():
-        os.makedirs(f"{args.output}/{name}")
+    try:
+        for name, grid_config in config_dict["grids"].items():
+            os.makedirs(f"{args.output}/{name}", exist_ok=True)
 
-        nm_pairs = [[(k, v) for v in get_list(grid_config[k])] for k in grid_config]
-        combinations = itertools.product(*nm_pairs)
+            nm_pairs = [[(k, v) for v in get_list(grid_config[k])] for k in grid_config]
+            combinations = itertools.product(*nm_pairs)
 
-        # parse args
-        args_list, comb_dict = [], {}
-        for i, c in enumerate(combinations, 1):
-            parsed_args, args_dict = [], {}
-            for j in c:
-                par_name, par_value = j
-                if isinstance(par_value, bool) and par_value:
-                    parsed_args.append(f"--{par_name}")
-                elif isinstance(par_value, (list, tuple)):
-                    parsed_args.extend([f"--{par_name}", *[str(v) for v in par_value]])
-                elif par_name in ['sed-params', 'precomputed-train', 'vocabulary']:
-                    continue
-                else:
-                    parsed_args.extend([f"--{par_name}", str(par_value)])
-                args_dict[par_name] = par_value
-            args_list.append(parsed_args)
-            comb_dict[i] = args_dict
+            # parse args
+            args_list, comb_dict = [], {}
+            for i, c in enumerate(combinations, 1):
+                args_dict = dict(c)
+                args_list.append(build_option_args(args_dict))
+                comb_dict[i] = args_dict
 
-        with open(f"{args.output}/{name}/combinations.json", "w") as f:
-            json.dump(comb_dict, f, indent=4)
+            with open(f"{args.output}/{name}/combinations.json", "w") as f:
+                json.dump(comb_dict, f, indent=4)
 
-        # train
-        for i, args_ in enumerate(args_list, 1):
-            for lang in config_dict['data']['languages']:
-                for j in range(1, config_dict['runs_per_model']+1):
-                    # reset ext_args
-                    ext_args = args_.copy()
+            # train
+            for i, args_ in enumerate(args_list, 1):
+                for lang in config_dict['data']['languages']:
+                    for j in range(1, config_dict['runs_per_model']+1):
+                        # reset ext_args
+                        ext_args = args_.copy()
 
-                    output = f"{args.output}/{name}/{lang}/{i}/{i}.{j}"
+                        output = f"{args.output}/{name}/{lang}/{i}/{i}.{j}"
 
-                    for par in ['sed-params', 'vocabulary']:
-                        if par in grid_config and lang in grid_config[par]:
+                        for par in ['sed-params', 'vocabulary']:
+                            if par in grid_config and lang in grid_config[par]:
+                                ext_args.extend(
+                                    [
+                                        "--"+par, grid_config[par][lang]
+                                    ]
+                                )
+
+                        # create file names from pattern
+                        dev_file = file_name_from_pattern(config_dict['data']['pattern'], lang, 'dev')
+                        test_file = file_name_from_pattern(config_dict['data']['pattern'], lang, 'test')
+
+                        dev = f"{config_dict['data']['path']}/{dev_file}"
+                        test = f"{config_dict['data']['path']}/{test_file}"
+
+                        # for train it's only needed if --train-precomputed is not specified
+                        if not ('precomputed-train' in grid_config and lang in grid_config['precomputed-train']):
+                            train_file = file_name_from_pattern(config_dict['data']['pattern'], lang, 'train')
+                            train = f"{config_dict['data']['path']}/{train_file}"
+                            train_par = ("--train", train)
+                        else:
+                            train_par = ("--precomputed-train", grid_config['precomputed-train'][lang])
+
+                        ext_args.extend(
+                            [
+                                "--output", output,
+                                *train_par,
+                                "--dev", dev
+                             ]
+                        )
+
+                        if os.path.exists(test):
                             ext_args.extend(
                                 [
-                                    "--"+par, grid_config[par][lang]
+                                    "--test", test
                                 ]
                             )
 
-                    # create file names from pattern
-                    dev_file = file_name_from_pattern(config_dict['data']['pattern'], lang, 'dev')
-                    test_file = file_name_from_pattern(config_dict['data']['pattern'], lang, 'test')
+                        p = subprocess.Popen(build_train_command(ext_args), bufsize=0)
+                        process_list.append(p)
+                        ACTIVE_PROCESSES.append(p)
 
-                    dev = f"{config_dict['data']['path']}/{dev_file}"
-                    test = f"{config_dict['data']['path']}/{test_file}"
+                        if len(process_list) < args.parallel_jobs:
+                            continue
 
-                    # for train it's only needed if --train-precomputed is not specified
-                    if not ('precomputed-train' in grid_config and lang in grid_config['precomputed-train']):
-                        train_file = file_name_from_pattern(config_dict['data']['pattern'], lang, 'train')
-                        train = f"{config_dict['data']['path']}/{train_file}"
-                        train_par = ("--train", train)
-                    else:
-                        train_par = ("--precomputed-train", grid_config['precomputed-train'][lang])
+                        while len(process_list) >= args.parallel_jobs:
+                            finished = [p for p in process_list if p.poll() is not None]
+                            for p in finished:
+                                if p.returncode != 0:
+                                    raise RuntimeError(f"Training command failed with return code {p.returncode}.")
+                            process_list = [p for p in process_list if p.poll() is None]
+                            # check every few seconds
+                            time.sleep(5)
 
-                    ext_args.extend(
-                        [
-                            "--output", output,
-                            *train_par,
-                            "--dev", dev
-                         ]
-                    )
-
-                    if os.path.exists(test):
-                        ext_args.extend(
-                            [
-                                "--test", test
-                            ]
-                        )
-
-                    p = subprocess.Popen(["trans-train"]+ext_args, bufsize=0)
-                    process_list.append(p)
-
-                    if len(process_list) < args.parallel_jobs:
-                        continue
-
-                    while len(process_list) >= args.parallel_jobs:
-                        process_list = [p for p in process_list if p.poll() is
-                                        None]
-                        # check every few seconds
-                        time.sleep(5)
-
-    # all trainings in progress, stay in script so all processes can be aborted
-    while len(process_list) > 0:
-        process_list = [p for p in process_list if p.poll() is
-                        None]
-        # check every few seconds
-        time.sleep(5)
+        # all trainings in progress, stay in script so all processes can be aborted
+        while len(process_list) > 0:
+            finished = [p for p in process_list if p.poll() is not None]
+            for p in finished:
+                if p.returncode != 0:
+                    raise RuntimeError(f"Training command failed with return code {p.returncode}.")
+            process_list = [p for p in process_list if p.poll() is None]
+            # check every few seconds
+            time.sleep(5)
+    finally:
+        for p in process_list:
+            if p.poll() is None:
+                p.kill()
+        ACTIVE_PROCESSES[:] = [p for p in ACTIVE_PROCESSES if p.poll() is None]
 
     # evaluate: average of results per combination and ensemble
     for name, grid_config in config_dict["grids"].items():
