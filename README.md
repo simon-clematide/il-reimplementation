@@ -89,6 +89,23 @@ The following parameters are available:
 The command ``trans-grid-search --help`` can be run to get information about 
 the available parameters.
 
+### SED Analysis
+To inspect source-target pairs that are surprising under a fitted stochastic
+edit-distance model, use ``trans-analyze-sed``. The following parameters are
+required:
+* ``--sed-params`` path to a fitted ``sed.pkl`` file
+* ``--input`` path to a TSV file with source and target in the first two columns
+
+Example:
+
+        trans-analyze-sed --sed-params data.d/sed-2021/low_ita/sed.pkl \
+          --input data.d/sigmorphon2021/low/ita_train.tsv \
+          --output data.d/ita_train_sed_analysis.tsv \
+          --sort-by target_length_surprisal
+
+The output is a TSV table with stochastic surprisal, normalized surprisal,
+Viterbi surprisal, alignment ambiguity, and the best Viterbi alignment.
+
 #### Configuration file
 The JSON-based configuration file needs to be passed via ``--config`` parameter.
 It basically contains information about the used data as well as model (hyper)parameters.
