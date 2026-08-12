@@ -14,7 +14,8 @@ from trans import utils
 from trans.actions import Copy, Del, Edit, EndOfSequence, Ins, Sub
 
 
-LARGE_NEG_CONST = -float(10 ** 6)
+LOG_ZERO = -np.inf
+DEFAULT_UNKNOWN_LOG_PROB = -float(10 ** 6)
 
 
 @dataclasses.dataclass
@@ -55,7 +56,7 @@ class StochasticEditDistance(actions.Aligner):
         self.delta_del = params.delta_del
         self.delta_ins = params.delta_ins
         self.delta_eos = params.delta_eos
-        self.default = LARGE_NEG_CONST  # ad-hoc fix for unseen inputs / outputs
+        self.default = DEFAULT_UNKNOWN_LOG_PROB  # floor for unseen inputs / outputs
 
         if not np.isclose(0., self.params.sum()):
             raise ValueError(
@@ -144,11 +145,13 @@ class StochasticEditDistance(actions.Aligner):
         Computes dynamic programming table (in log real) filled with forward
         log probabilities."""
         T, V = len(source), len(target)
-        alpha = np.full((T + 1, V + 1), LARGE_NEG_CONST)
+        alpha = np.full((T + 1, V + 1), LOG_ZERO)
         alpha[0, 0] = 0.
         for t in range(T + 1):
             for v in range(V + 1):
-                summands = [alpha[t, v]]
+                if t == 0 and v == 0:
+                    continue
+                summands = []
                 if v > 0:
                     summands.append(
                         self.delta_ins.get(target[v - 1], self.default) +
@@ -165,7 +168,8 @@ class StochasticEditDistance(actions.Aligner):
                             (source[t - 1], target[v - 1]), self.default) +
                         alpha[t - 1, v - 1]
                     )
-                alpha[t, v] = logsumexp(summands)
+                if summands:
+                    alpha[t, v] = logsumexp(summands)
         alpha[T, V] += self.delta_eos
         return alpha
 
@@ -177,11 +181,13 @@ class StochasticEditDistance(actions.Aligner):
         probabilities (the probabilities of the suffix, i.e.
         p(source[t:], target[v:]). E.g. p("", "a") = p(ins(a))*p(#)."""
         T, V = len(source), len(target)
-        beta = np.full((T + 1, V + 1), LARGE_NEG_CONST)
+        beta = np.full((T + 1, V + 1), LOG_ZERO)
         beta[T, V] = self.delta_eos
         for t in range(T, -1, -1):
             for v in range(V, -1, -1):
-                summands = [beta[t, v]]
+                if t == T and v == V:
+                    continue
+                summands = []
                 if v < V:
                     summands.append(
                         self.delta_ins.get(target[v], self.default) +
@@ -198,7 +204,8 @@ class StochasticEditDistance(actions.Aligner):
                             (source[t], target[v]), self.default) +
                         beta[t + 1, v + 1]
                     )
-                beta[t, v] = logsumexp(summands)
+                if summands:
+                    beta[t, v] = logsumexp(summands)
         return beta
 
     def log_likelihood(self, sources: Iterable[Sequence[Any]],
@@ -292,63 +299,58 @@ class StochasticEditDistance(actions.Aligner):
             Probability score and, optionally, the sequence of edits that gives
             this score."""
         T, V = len(source), len(target)
-        alpha = np.full((T + 1, V + 1), LARGE_NEG_CONST)
+        alpha = np.full((T + 1, V + 1), LOG_ZERO)
+        backptr = np.empty((T + 1, V + 1), dtype=object)
         alpha[0, 0] = 0.
         for t in range(T + 1):
             for v in range(V + 1):
-                alternatives = [alpha[t, v]]
+                if t == 0 and v == 0:
+                    continue
+                alternatives = []
                 if v > 0:
                     alternatives.append(
-                        self.delta_ins.get(target[v - 1], self.default) +
-                        alpha[t, v - 1])
+                        (self.delta_ins.get(target[v - 1], self.default) +
+                         alpha[t, v - 1],
+                         ("ins", t, v - 1)))
                 if t > 0:
                     alternatives.append(
-                        self.delta_del.get(source[t - 1], self.default) +
-                        alpha[t - 1, v])
+                        (self.delta_del.get(source[t - 1], self.default) +
+                         alpha[t - 1, v],
+                         ("del", t - 1, v)))
                 if v > 0 and t > 0:
                     alternatives.append(
-                        self.delta_sub.get(
+                        (self.delta_sub.get(
                             (source[t - 1], target[v - 1]), self.default) +
-                        alpha[t - 1, v - 1])
-                alpha[t, v] = max(alternatives)
-        alpha[T, V] += self.delta_eos
-        optim_score = alpha[T, V]
+                         alpha[t - 1, v - 1],
+                         ("sub", t - 1, v - 1)))
+                score, predecessor = max(alternatives, key=lambda x: x[0])
+                alpha[t, v] = score
+                backptr[t, v] = predecessor
+        optim_score = alpha[T, V] + self.delta_eos
         if not with_alignment:
             return optim_score
         # compute an optimal alignment
         alignment = []
         ind_w, ind_c = len(source), len(target)
-        while ind_w >= 0 and ind_c >= 0:
-            if ind_w == 0 and ind_c == 0:
-                return alignment[::-1], optim_score
-            if ind_w == 0:
-                # can only go left, i.e. via insertions
-                ind_c -= 1
-                alignment.append(
-                    Ins(target[ind_c]))  # minus 1 is due to offset
-            elif ind_c == 0:
-                # can only go up, i.e. via deletions
-                ind_w -= 1
-                alignment.append(
-                    Del(source[ind_w]))  # minus 1 is due to offset
+        while ind_w > 0 or ind_c > 0:
+            operation, prev_w, prev_c = backptr[ind_w, ind_c]
+            if operation == "ins":
+                alignment.append(Ins(target[ind_c - 1]))
+            elif operation == "del":
+                alignment.append(Del(source[ind_w - 1]))
+            elif operation == "sub":
+                alignment.append(Sub(source[ind_w - 1], target[ind_c - 1]))
             else:
-                # pick the smallest cost actions
-                pind_w = ind_w - 1
-                pind_c = ind_c - 1
-                action_idx = np.argmax([alpha[pind_w, pind_c],
-                                        alpha[ind_w, pind_c],
-                                        alpha[pind_w, ind_c]])
-                if action_idx == 0:
-                    action = Sub(source[pind_w], target[pind_c])
-                    ind_w = pind_w
-                    ind_c = pind_c
-                elif action_idx == 1:
-                    action = Ins(target[pind_c])
-                    ind_c = pind_c
-                else:
-                    action = Del(source[pind_w])
-                    ind_w = pind_w
-                alignment.append(action)
+                raise ValueError(f"Unknown Viterbi backpointer operation: {operation}")
+            ind_w, ind_c = prev_w, prev_c
+        return alignment[::-1], optim_score
+
+    def alignment_log_probability(self, alignment: Sequence[Edit],
+                                  include_eos: bool = True) -> float:
+        score = -sum(self.action_cost(action) for action in alignment)
+        if include_eos:
+            score += self.delta_eos
+        return score
 
     def stochastic_distance(self, source: Sequence[Any],
                             target: Sequence[Any]) -> float:
