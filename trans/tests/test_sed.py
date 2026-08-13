@@ -45,6 +45,16 @@ class TestTransducer(unittest.TestCase):
             else:
                 self.assertTrue(np.isclose(eos_weight, weight))
 
+    def test_sed_validates_copy_probability_for_disjoint_alphabets(self):
+        for copy_probability in (0, 1, 2, -0.1):
+            with self.subTest(copy_probability=copy_probability):
+                with self.assertRaisesRegex(ValueError, "copy probability"):
+                    sed.StochasticEditDistance.build_sed(
+                        source_alphabet="ab",
+                        target_alphabet="xy",
+                        copy_probability=copy_probability,
+                    )
+
     def test_viterbi_decoding(self):
 
         best_edits, distance = self.smart_sed.viterbi_distance(
