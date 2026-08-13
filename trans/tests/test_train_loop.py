@@ -5,10 +5,67 @@ import os
 import tempfile
 import unittest
 
+import torch
+
 from trans import train
 
 
+class CountingSGD(torch.optim.SGD):
+    def __init__(self, params, **kwargs):
+        super().__init__(params, **kwargs)
+        self.step_count = 0
+
+    def step(self, closure=None):
+        self.step_count += 1
+        return super().step(closure)
+
+
 class TestGradientAccumulation(unittest.TestCase):
+
+    @staticmethod
+    def run_accumulated_updates(model, micro_batches, accumulation):
+        optimizer = CountingSGD(model.parameters(), lr=0.1)
+        optimizer.zero_grad(set_to_none=True)
+        batch_count = len(micro_batches)
+        for i, (x, y) in enumerate(micro_batches):
+            prediction = model(x)
+            losses = (prediction - y).pow(2).mean(dim=1)
+            scale = train.accumulation_loss_scale(i, batch_count, accumulation)
+            (torch.mean(losses) / scale).backward()
+            if train.should_step(i, batch_count, accumulation):
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+        return optimizer
+
+    @staticmethod
+    def run_reference_updates(model, groups):
+        optimizer = CountingSGD(model.parameters(), lr=0.1)
+        for group in groups:
+            optimizer.zero_grad(set_to_none=True)
+            x = torch.cat([batch[0] for batch in group], dim=0)
+            y = torch.cat([batch[1] for batch in group], dim=0)
+            prediction = model(x)
+            loss = (prediction - y).pow(2).mean()
+            loss.backward()
+            optimizer.step()
+        return optimizer
+
+    @staticmethod
+    def linear_model():
+        model = torch.nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            model.weight.fill_(0.5)
+        return model
+
+    @staticmethod
+    def micro_batches():
+        return [
+            (torch.tensor([[1.0]]), torch.tensor([[2.0]])),
+            (torch.tensor([[2.0]]), torch.tensor([[1.0]])),
+            (torch.tensor([[3.0]]), torch.tensor([[0.0]])),
+            (torch.tensor([[4.0]]), torch.tensor([[1.0]])),
+            (torch.tensor([[5.0]]), torch.tensor([[3.0]])),
+        ]
 
     def test_should_step_every_accumulation_and_final_batch(self):
         cases = {
@@ -37,6 +94,33 @@ class TestGradientAccumulation(unittest.TestCase):
             train.should_step(0, 1, 0)
         with self.assertRaises(ValueError):
             train.accumulation_loss_scale(0, 1, 0)
+
+    def test_accumulation_steps_trailing_partial_group(self):
+        model = self.linear_model()
+
+        optimizer = self.run_accumulated_updates(
+            model, self.micro_batches(), accumulation=2)
+
+        self.assertEqual(3, optimizer.step_count)
+
+    def test_accumulated_updates_match_grouped_reference_updates(self):
+        micro_batches = self.micro_batches()
+        accumulated_model = self.linear_model()
+        reference_model = self.linear_model()
+
+        accumulated_optimizer = self.run_accumulated_updates(
+            accumulated_model, micro_batches, accumulation=2)
+        reference_optimizer = self.run_reference_updates(
+            reference_model,
+            [micro_batches[0:2], micro_batches[2:4], micro_batches[4:5]],
+        )
+
+        self.assertEqual(reference_optimizer.step_count,
+                         accumulated_optimizer.step_count)
+        self.assertTrue(torch.allclose(
+            reference_model.weight,
+            accumulated_model.weight,
+        ))
 
     def test_write_checkpoint_metadata(self):
         args = argparse.Namespace(device="cpu", epochs=1)
