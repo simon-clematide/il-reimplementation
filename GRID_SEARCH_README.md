@@ -20,8 +20,8 @@ trans-grid-search --config grid.json --output runs/grid-search --ensemble
 
 `--parallel-jobs` is optional. If omitted, the default is `30` for CPU-only
 grids and `4` when any grid config contains a non-CPU `device` such as `mps` or
-`cuda`. Pass the option explicitly for production runs so the experiment records
-the intended concurrency.
+`cuda`. The effective concurrency, whether explicit or automatically selected,
+is recorded in `run_metadata.json`.
 
 ## Configuration Model
 
@@ -55,12 +55,14 @@ data.d/sigmorphon/ita_dev.tsv
 data.d/sigmorphon/ita_test.tsv
 ```
 
-`train` and `dev` are required unless a language has `precomputed-train`.
-`test` is optional. If a test file exists, every successful run is expected to
-produce test evaluation artifacts.
+`dev` is always required. `train` is required unless a language has
+`precomputed-train`. `test` is optional. If a test file exists, every
+successful run is expected to produce test evaluation artifacts.
 
 `runs_per_model` controls replicate count per language and combination. The
 runner creates directories such as `1.1`, `1.2`, `1.3` for combination `1`.
+If top-level `seeds` are provided, their length must equal `runs_per_model`,
+and run `j` receives `--pytorch-seed seeds[j - 1]`.
 
 Each entry under `grids` is a named sweep. Scalar values are passed unchanged to
 `trans-train`; list values create Cartesian-product dimensions. Booleans are
@@ -96,7 +98,8 @@ They are language-specific mappings and are excluded from the Cartesian product.
 ```
 
 Unknown language keys are rejected during preflight validation, so a typo such
-as `"tia"` fails before jobs are launched.
+as `"tia"` fails before jobs are launched. These values must be JSON objects
+mapping language names to file paths.
 
 ## Example: CPU Sweep
 
@@ -108,10 +111,10 @@ as `"tia"` fails before jobs are launched.
     "languages": ["ita"]
   },
   "runs_per_model": 3,
+  "seeds": [1, 2, 3],
   "grids": {
     "lstm_small": {
       "device": "cpu",
-      "pytorch-seed": [1, 2, 3],
       "enc-type": "lstm",
       "char-dim": 64,
       "action-dim": 64,
@@ -144,10 +147,10 @@ trans-grid-search --config grid_cpu.json --output runs/ita-cpu --parallel-jobs 3
     "languages": ["ita"]
   },
   "runs_per_model": 2,
+  "seeds": [1, 2],
   "grids": {
     "mps_lstm": {
       "device": "mps",
-      "pytorch-seed": [1, 2],
       "enc-type": "lstm",
       "char-dim": 128,
       "action-dim": 128,
@@ -179,7 +182,9 @@ For a grid named `lstm`, language `ita`, combination `1`, and three runs:
 ```text
 runs/grid-search/
   lstm/
+    config.json
     combinations.json
+    run_metadata.json
     ita/
       1/
         1.1/
@@ -194,13 +199,23 @@ runs/grid-search/
       ensemble_results.txt
 ```
 
-`combinations.json` maps combination ids to hyperparameters. Evaluation uses
-the expected run names from `runs_per_model`; ensemble directories are ignored
-when averaging.
+`config.json` is the complete input experiment configuration, including
+`runs_per_model` and `seeds`.
 
-`results.txt` contains average scores across runs, sorted by `dev_greedy`.
-Beam labels are stored per result row, so combinations with different beam
-widths are reported correctly.
+`combinations.json` maps combination ids to expanded Cartesian hyperparameter
+combinations. Combination IDs are shared across languages within a named grid;
+language-specific resources do not affect combination numbering.
+
+`run_metadata.json` records effective grid-runner settings, including resolved
+`parallel_jobs` and whether `ensemble` was requested.
+
+Evaluation uses the expected run names from `runs_per_model`; ensemble
+directories are ignored when averaging.
+
+`results.txt` contains individual-model scores across runs as
+`mean ± sample SD`, sorted by mean `dev_greedy`. With one replicate, SD is
+reported as `0.0000`. Beam labels are stored per result row, so combinations
+with different beam widths are reported correctly.
 
 ## Ensembles
 
@@ -215,6 +230,9 @@ beam5_ensemble/
 
 and summarized in `ensemble_results.txt`.
 
+Ensemble scores are single aggregate results over the per-run prediction files.
+They are not replicate distributions, so no SD is reported for ensemble rows.
+
 ## Validation And Failure Behavior
 
 Before launching training jobs, the runner validates:
@@ -222,10 +240,14 @@ Before launching training jobs, the runner validates:
 - `runs_per_model >= 1`
 - nonempty `data.languages`
 - `data.pattern` contains `LANG` and `SPLIT`
-- required train/dev files exist
+- required dev files exist
+- train files exist unless the language has `precomputed-train`
 - language-specific `sed-params`, `precomputed-train`, and `vocabulary` paths exist
 - language-specific mappings contain only configured languages
+- language-specific mappings are JSON objects from language name to file path
 - `beam-width` is a nonnegative integer
+- top-level `seeds`, if present, is a list of integer seeds with length
+  `runs_per_model`
 
 After training, expected evaluation and prediction artifacts are validated
 before averaging or ensembling. Missing artifacts fail with a contextual
@@ -237,28 +259,29 @@ output directory, return code, and command.
 
 ## Reproducibility Notes
 
-The grid runner currently passes through whatever seed configuration you put in
-the grid, most commonly `pytorch-seed`. If you want deterministic replicates,
-make seed values explicit in the grid, for example:
+For deterministic replicates, prefer top-level `seeds`:
 
 ```json
 {
-  "pytorch-seed": [1, 2, 3]
+  "runs_per_model": 3,
+  "seeds": [1, 2, 3]
 }
 ```
 
-Be aware that `runs_per_model` and a seed list are independent Cartesian
-dimensions. If you set both `runs_per_model: 3` and `pytorch-seed: [1, 2, 3]`,
-you will run nine jobs per non-seed combination. For a one-to-one mapping from
-replicate number to seed, the runner would need an explicit seed-list feature;
-that is not implemented yet.
+This gives run `1.1` seed `1`, run `1.2` seed `2`, and run `1.3` seed `3`.
+Do not also specify `pytorch-seed` inside a grid when top-level `seeds` are
+present; the runner rejects that ambiguity.
+
+If you put `pytorch-seed` inside a grid, it remains a normal hyperparameter
+dimension. That is useful only when you intentionally want to compare seed
+values as part of the Cartesian product.
 
 ## Current Limitations
 
 There is no resume or overwrite mode. Existing output directories are reused
-and `combinations.json` is overwritten. For professional experiment tracking,
-prefer a fresh output directory per sweep until explicit `--resume` and
-`--overwrite` semantics are added.
+and metadata files are overwritten. For professional experiment tracking, prefer
+a fresh output directory per sweep until explicit `--resume` and `--overwrite`
+semantics are added.
 
 Selection is currently implicit: result files are sorted by `dev_greedy`. If
 your protocol selects hyperparameters by beam performance, document that

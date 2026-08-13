@@ -6,8 +6,10 @@ import json
 import subprocess
 import os
 import itertools
+import math
 import time
 import atexit
+from collections.abc import Sequence
 from typing import Any, Optional, List
 
 
@@ -149,6 +151,21 @@ def last_value_from_file(file_path: str, t=float):
                 f"{lines[-1]!r}") from exc
 
 
+def summarize_scores(scores: List[float]) -> tuple:
+    if not scores:
+        raise ValueError("Cannot summarize empty score list.")
+    mean = sum(scores) / len(scores)
+    if len(scores) == 1:
+        return mean, 0.
+    variance = sum((score - mean) ** 2 for score in scores) / (len(scores) - 1)
+    return mean, math.sqrt(variance)
+
+
+def format_score_summary(scores: List[float]) -> str:
+    mean, std = summarize_scores(scores)
+    return f"{mean:.4f} ± {std:.4f}"
+
+
 def get_list(var: Any):
     return var if isinstance(var, list) else [var]
 
@@ -196,6 +213,13 @@ def validate_config(config_dict: dict) -> None:
         raise ValueError("runs_per_model must be >= 1.")
     seeds = config_dict.get("seeds")
     if seeds is not None:
+        if (
+                isinstance(seeds, (str, bytes, dict)) or
+                not isinstance(seeds, Sequence)):
+            raise ValueError("seeds must be a list of integer seeds.")
+        for seed in seeds:
+            if isinstance(seed, bool) or not isinstance(seed, int):
+                raise ValueError("seeds must be a list of integer seeds.")
         if len(seeds) != config_dict["runs_per_model"]:
             raise ValueError("len(seeds) must equal runs_per_model.")
     languages = config_dict["data"]["languages"]
@@ -295,7 +319,7 @@ def run_ensemble(gold: str, systems: List[str], output: str):
 
 def write_to_results_file(results_file: str, results: List[dict]):
     with open(results_file, "w") as f:
-        for r in sorted(results, key=lambda x: x['dev_greedy'], reverse=True):
+        for r in sorted(results, key=lambda x: x['dev_greedy_mean'], reverse=True):
             f.write(r['c_dir'] + "\n")
             f.write(f"dev\ngreedy: {r['dev_greedy']}\n")
             if r['dev_beam'] is not None:
@@ -306,6 +330,20 @@ def write_to_results_file(results_file: str, results: List[dict]):
                 f.write(f"{r['beam_width']}: {r['test_beam']}\n\n")
             else:
                 f.write("\n")
+
+
+def write_experiment_metadata(output_dir: str, config_dict: dict,
+                              comb_dict: dict, parallel_jobs: int,
+                              ensemble: bool) -> None:
+    with open(f"{output_dir}/config.json", "w") as f:
+        json.dump(config_dict, f, indent=4)
+    with open(f"{output_dir}/combinations.json", "w") as f:
+        json.dump(comb_dict, f, indent=4)
+    with open(f"{output_dir}/run_metadata.json", "w") as f:
+        json.dump({
+            "parallel_jobs": parallel_jobs,
+            "ensemble": ensemble,
+        }, f, indent=4)
 
 
 def main(args: argparse.Namespace):
@@ -328,9 +366,9 @@ def main(args: argparse.Namespace):
 
             # parse args
             args_list, comb_dict = grid_search_combinations(grid_config)
-
-            with open(f"{args.output}/{name}/combinations.json", "w") as f:
-                json.dump(comb_dict, f, indent=4)
+            write_experiment_metadata(
+                f"{args.output}/{name}", config_dict, comb_dict,
+                parallel_jobs, args.ensemble)
 
             # train
             for i, args_ in enumerate(args_list, 1):
@@ -413,8 +451,8 @@ def main(args: argparse.Namespace):
 
             # level: combination
             for c_dir in [str(i) for i in sorted(comb_dict)]:  # c_dir == name of combination (number)
-                dev_beam_avg, dev_greedy_avg = 0, 0
-                test_beam_avg, test_greedy_avg = 0, 0
+                dev_beam_scores, dev_greedy_scores = [], []
+                test_beam_scores, test_greedy_scores = [], []
                 c_dir_path = f"{output_path}/{c_dir}"  # directory of combination
                 combination = comb_dict[int(c_dir)]
                 run_dirs = [
@@ -459,26 +497,34 @@ def main(args: argparse.Namespace):
                 # level: run per combination
                 for c_run in run_dirs:
                     # dev greedy
-                    dev_greedy_avg += last_value_from_file(f"{c_dir_path}/{c_run}/dev_greedy.eval")/n_runs
+                    dev_greedy_scores.append(last_value_from_file(
+                        f"{c_dir_path}/{c_run}/dev_greedy.eval"))
 
                     # dev beam
                     if beam_width:
-                        dev_beam_avg += last_value_from_file(f"{c_dir_path}/{c_run}/dev_{beam_width}.eval")/n_runs
+                        dev_beam_scores.append(last_value_from_file(
+                            f"{c_dir_path}/{c_run}/dev_{beam_width}.eval"))
 
                     if has_test:
                         # test greedy
-                        test_greedy_avg += last_value_from_file(f"{c_dir_path}/{c_run}/test_greedy.eval")/n_runs
+                        test_greedy_scores.append(last_value_from_file(
+                            f"{c_dir_path}/{c_run}/test_greedy.eval"))
                         # test beam
                         if beam_width:
-                            test_beam_avg += last_value_from_file(f"{c_dir_path}/{c_run}/test_{beam_width}.eval")/n_runs
+                            test_beam_scores.append(last_value_from_file(
+                                f"{c_dir_path}/{c_run}/test_{beam_width}.eval"))
 
                 result = {
                     'c_dir': c_dir,
                     'beam_width': beam_width,
-                    'dev_greedy': round(dev_greedy_avg, 4),
-                    'dev_beam': round(dev_beam_avg, 4) if beam_width else None,
-                    'test_greedy': round(test_greedy_avg, 4) if has_test else None,
-                    'test_beam': round(test_beam_avg, 4) if has_test and beam_width else None
+                    'dev_greedy_mean': summarize_scores(dev_greedy_scores)[0],
+                    'dev_greedy': format_score_summary(dev_greedy_scores),
+                    'dev_beam': format_score_summary(dev_beam_scores)
+                    if beam_width else None,
+                    'test_greedy': format_score_summary(test_greedy_scores)
+                    if has_test else None,
+                    'test_beam': format_score_summary(test_beam_scores)
+                    if has_test and beam_width else None
                 }
                 results.append(result)
 
@@ -486,6 +532,7 @@ def main(args: argparse.Namespace):
                     result = {
                         'c_dir': c_dir,
                         'beam_width': beam_width,
+                        'dev_greedy_mean': 0.,
                         'dev_beam': None,
                         'test_greedy': None,
                         'test_beam': None
@@ -498,6 +545,8 @@ def main(args: argparse.Namespace):
                         run_ensemble(gold_file, systems, f"{c_dir_path}/greedy_ensemble")
                         result[f"{split}_greedy"] =\
                             round(last_value_from_file(f"{c_dir_path}/greedy_ensemble/{split}_{n_runs}ensemble.eval"), 4)
+                        if split == "dev":
+                            result["dev_greedy_mean"] = result[f"{split}_greedy"]
                         # beam
                         if beam_width:
                             systems = \
