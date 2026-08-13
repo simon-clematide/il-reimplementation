@@ -1,34 +1,152 @@
 """CLI for performing grid search."""
 
 import argparse
+import dataclasses
 import json
 import subprocess
-import shutil
 import os
 import itertools
 import time
 import atexit
-import re
 from typing import Any, Optional, List
 
 
-BASH_EXECUTABLE = shutil.which("bash")
 ACTIVE_PROCESSES = []
+LANGUAGE_SPECIFIC_PARAMETERS = {
+    "sed-params",
+    "precomputed-train",
+    "vocabulary",
+}
+CPU_PARALLEL_JOBS_DEFAULT = 30
+ACCELERATOR_PARALLEL_JOBS_DEFAULT = 4
 
 
 def cleanup():
-    for p in ACTIVE_PROCESSES:
-        if p.poll() is None:
-            p.kill()
+    terminate_processes(ACTIVE_PROCESSES)
 
 
 atexit.register(cleanup)
 
 
+@dataclasses.dataclass
+class RunningProcess:
+    process: subprocess.Popen
+    command: List[str]
+    output: str
+    grid: str
+    language: str
+    combination: int
+    run: int
+
+    def failure_message(self) -> str:
+        return (
+            f"Training command failed with return code {self.process.returncode}: "
+            f"grid={self.grid} language={self.language} "
+            f"combination={self.combination} run={self.run} "
+            f"output={self.output} command={' '.join(self.command)}"
+        )
+
+
+def validate_parallel_jobs(parallel_jobs: int) -> None:
+    if parallel_jobs < 1:
+        raise ValueError(f"--parallel-jobs must be at least 1: {parallel_jobs}.")
+
+
+def default_parallel_jobs(config_dict: dict) -> int:
+    for grid_config in config_dict["grids"].values():
+        for device in get_list(grid_config.get("device", "cpu")):
+            if str(device).lower() != "cpu":
+                return ACCELERATOR_PARALLEL_JOBS_DEFAULT
+    return CPU_PARALLEL_JOBS_DEFAULT
+
+
+def terminate_processes(processes: List[RunningProcess], timeout: float = 5.) -> None:
+    for running in list(processes):
+        process = running.process
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+    processes[:] = [running for running in processes if running.process.poll() is None]
+
+
+class ProcessManager:
+    def __init__(self, parallel_jobs: int, poll_interval: float = 5.) -> None:
+        validate_parallel_jobs(parallel_jobs)
+        self.parallel_jobs = parallel_jobs
+        self.poll_interval = poll_interval
+        self.processes: List[RunningProcess] = []
+
+    def start(self, command: List[str], *, output: str, grid: str,
+              language: str, combination: int, run: int) -> RunningProcess:
+        process = subprocess.Popen(command, bufsize=0)
+        running = RunningProcess(
+            process=process,
+            command=command,
+            output=output,
+            grid=grid,
+            language=language,
+            combination=combination,
+            run=run,
+        )
+        self.processes.append(running)
+        ACTIVE_PROCESSES.append(running)
+        return running
+
+    def poll_finished(self) -> None:
+        finished = [
+            running for running in self.processes
+            if running.process.poll() is not None
+        ]
+        failures = [
+            running for running in finished
+            if running.process.returncode != 0
+        ]
+        self.processes = [
+            running for running in self.processes
+            if running.process.poll() is None
+        ]
+        ACTIVE_PROCESSES[:] = [
+            running for running in ACTIVE_PROCESSES
+            if running.process.poll() is None
+        ]
+        if failures:
+            raise RuntimeError(failures[0].failure_message())
+
+    def wait_for_slot(self) -> None:
+        while len(self.processes) >= self.parallel_jobs:
+            self.poll_finished()
+            if len(self.processes) >= self.parallel_jobs:
+                time.sleep(self.poll_interval)
+
+    def wait_all(self) -> None:
+        while self.processes:
+            self.poll_finished()
+            if self.processes:
+                time.sleep(self.poll_interval)
+
+    def terminate_all(self) -> None:
+        terminate_processes(self.processes)
+        ACTIVE_PROCESSES[:] = [
+            running for running in ACTIVE_PROCESSES
+            if running.process.poll() is None
+        ]
+
+
 def last_value_from_file(file_path: str, t=float):
     with open(file_path) as f:
-        lines = f.readlines()
-        return t(lines[-1].split()[-1])
+        lines = [line.strip() for line in f if line.strip()]
+        if not lines:
+            raise ValueError(f"Empty evaluation file: {file_path}")
+        try:
+            return t(lines[-1].split()[-1])
+        except (IndexError, ValueError) as exc:
+            raise ValueError(
+                f"Could not parse evaluation result from {file_path}: "
+                f"{lines[-1]!r}") from exc
 
 
 def get_list(var: Any):
@@ -39,6 +157,87 @@ def file_name_from_pattern(pattern: str, lang: str, split: str):
     file_name = pattern.replace("LANG", lang)
     file_name = file_name.replace("SPLIT", split)
     return file_name
+
+
+def beam_width_from_combination(combination: dict) -> Optional[str]:
+    beam_width = combination.get("beam-width")
+    if beam_width is None:
+        return None
+    if isinstance(beam_width, bool):
+        raise ValueError(
+            f"beam-width must be a nonnegative integer: {beam_width!r}.")
+    try:
+        beam_width_int = int(beam_width)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"beam-width must be a nonnegative integer: {beam_width!r}."
+        ) from exc
+    if beam_width_int != beam_width and str(beam_width_int) != str(beam_width):
+        raise ValueError(
+            f"beam-width must be a nonnegative integer: {beam_width!r}.")
+    if beam_width_int < 0:
+        raise ValueError(f"beam-width must be >= 0: {beam_width_int}.")
+    if beam_width_int == 0:
+        return None
+    return f"beam{beam_width_int}"
+
+
+def require_files(paths: List[str]) -> None:
+    missing = [path for path in paths if not os.path.isfile(path)]
+    if missing:
+        raise FileNotFoundError(
+            "Missing expected experiment artifacts:\n" +
+            "\n".join(missing)
+        )
+
+
+def validate_config(config_dict: dict) -> None:
+    if config_dict["runs_per_model"] < 1:
+        raise ValueError("runs_per_model must be >= 1.")
+    seeds = config_dict.get("seeds")
+    if seeds is not None:
+        if len(seeds) != config_dict["runs_per_model"]:
+            raise ValueError("len(seeds) must equal runs_per_model.")
+    languages = config_dict["data"]["languages"]
+    if not languages:
+        raise ValueError("data.languages must not be empty.")
+    pattern = config_dict["data"]["pattern"]
+    if "LANG" not in pattern or "SPLIT" not in pattern:
+        raise ValueError("data.pattern must contain LANG and SPLIT placeholders.")
+
+    configured_languages = set(languages)
+    required_files = set()
+    data_path = config_dict["data"]["path"]
+    for grid_config in config_dict["grids"].values():
+        for par in LANGUAGE_SPECIFIC_PARAMETERS:
+            if par not in grid_config:
+                continue
+            if not isinstance(grid_config[par], dict):
+                raise ValueError(f"{par} must map language names to file paths.")
+            unknown_languages = set(grid_config[par]) - configured_languages
+            if unknown_languages:
+                raise ValueError(
+                    f"{par} contains unknown languages: "
+                    f"{sorted(unknown_languages)}")
+        if seeds is not None and "pytorch-seed" in grid_config:
+            raise ValueError(
+                "Do not specify both top-level seeds and grid-level pytorch-seed.")
+        for _, combination in grid_search_combinations(grid_config)[1].items():
+            beam_width_from_combination(combination)
+
+    for lang in languages:
+        dev_file = file_name_from_pattern(pattern, lang, "dev")
+        required_files.add(f"{data_path}/{dev_file}")
+        for grid_config in config_dict["grids"].values():
+            if not (
+                    "precomputed-train" in grid_config and
+                    lang in grid_config["precomputed-train"]):
+                train_file = file_name_from_pattern(pattern, lang, "train")
+                required_files.add(f"{data_path}/{train_file}")
+            for par in LANGUAGE_SPECIFIC_PARAMETERS:
+                if par in grid_config and lang in grid_config[par]:
+                    required_files.add(grid_config[par][lang])
+    require_files(sorted(required_files))
 
 
 def build_option_args(config: dict) -> List[str]:
@@ -54,6 +253,22 @@ def build_option_args(config: dict) -> List[str]:
         else:
             parsed_args.extend([f"--{par_name}", str(par_value)])
     return parsed_args
+
+
+def grid_search_combinations(grid_config: dict):
+    search_config = {
+        k: v for k, v in grid_config.items()
+        if k not in LANGUAGE_SPECIFIC_PARAMETERS
+    }
+    nm_pairs = [[(k, v) for v in get_list(search_config[k])] for k in search_config]
+    combinations = itertools.product(*nm_pairs)
+
+    args_list, comb_dict = [], {}
+    for i, c in enumerate(combinations, 1):
+        args_dict = dict(c)
+        args_list.append(build_option_args(args_dict))
+        comb_dict[i] = args_dict
+    return args_list, comb_dict
 
 
 def build_train_command(extra_args: List[str]) -> List[str]:
@@ -78,17 +293,17 @@ def run_ensemble(gold: str, systems: List[str], output: str):
             f"{' '.join(build_ensemble_command(gold, systems, output))}")
 
 
-def write_to_results_file(results_file: str, results: List[dict], beam_width: Optional[str] = None):
+def write_to_results_file(results_file: str, results: List[dict]):
     with open(results_file, "w") as f:
         for r in sorted(results, key=lambda x: x['dev_greedy'], reverse=True):
             f.write(r['c_dir'] + "\n")
             f.write(f"dev\ngreedy: {r['dev_greedy']}\n")
-            if r['dev_beam']:
-                f.write(f"{beam_width}: {r['dev_beam']}\n")
-            if r['test_greedy']:
+            if r['dev_beam'] is not None:
+                f.write(f"{r['beam_width']}: {r['dev_beam']}\n")
+            if r['test_greedy'] is not None:
                 f.write(f"test\ngreedy: {r['test_greedy']}\n")
-            if r['test_beam']:
-                f.write(f"{beam_width}: {r['test_beam']}\n\n")
+            if r['test_beam'] is not None:
+                f.write(f"{r['beam_width']}: {r['test_beam']}\n\n")
             else:
                 f.write("\n")
 
@@ -99,20 +314,20 @@ def main(args: argparse.Namespace):
     with open(args.config) as config_file:
         config_dict = json.load(config_file)
 
-    process_list = []
+    validate_config(config_dict)
+    parallel_jobs = args.parallel_jobs
+    if parallel_jobs is None:
+        parallel_jobs = default_parallel_jobs(config_dict)
+    validate_parallel_jobs(parallel_jobs)
+
+    process_manager = ProcessManager(parallel_jobs)
+    seeds = config_dict.get("seeds")
     try:
         for name, grid_config in config_dict["grids"].items():
             os.makedirs(f"{args.output}/{name}", exist_ok=True)
 
-            nm_pairs = [[(k, v) for v in get_list(grid_config[k])] for k in grid_config]
-            combinations = itertools.product(*nm_pairs)
-
             # parse args
-            args_list, comb_dict = [], {}
-            for i, c in enumerate(combinations, 1):
-                args_dict = dict(c)
-                args_list.append(build_option_args(args_dict))
-                comb_dict[i] = args_dict
+            args_list, comb_dict = grid_search_combinations(grid_config)
 
             with open(f"{args.output}/{name}/combinations.json", "w") as f:
                 json.dump(comb_dict, f, indent=4)
@@ -123,6 +338,8 @@ def main(args: argparse.Namespace):
                     for j in range(1, config_dict['runs_per_model']+1):
                         # reset ext_args
                         ext_args = args_.copy()
+                        if seeds is not None:
+                            ext_args.extend(["--pytorch-seed", str(seeds[j - 1])])
 
                         output = f"{args.output}/{name}/{lang}/{i}/{i}.{j}"
 
@@ -164,39 +381,25 @@ def main(args: argparse.Namespace):
                                 ]
                             )
 
-                        p = subprocess.Popen(build_train_command(ext_args), bufsize=0)
-                        process_list.append(p)
-                        ACTIVE_PROCESSES.append(p)
-
-                        if len(process_list) < args.parallel_jobs:
-                            continue
-
-                        while len(process_list) >= args.parallel_jobs:
-                            finished = [p for p in process_list if p.poll() is not None]
-                            for p in finished:
-                                if p.returncode != 0:
-                                    raise RuntimeError(f"Training command failed with return code {p.returncode}.")
-                            process_list = [p for p in process_list if p.poll() is None]
-                            # check every few seconds
-                            time.sleep(5)
+                        process_manager.wait_for_slot()
+                        command = build_train_command(ext_args)
+                        process_manager.start(
+                            command,
+                            output=output,
+                            grid=name,
+                            language=lang,
+                            combination=i,
+                            run=j,
+                        )
 
         # all trainings in progress, stay in script so all processes can be aborted
-        while len(process_list) > 0:
-            finished = [p for p in process_list if p.poll() is not None]
-            for p in finished:
-                if p.returncode != 0:
-                    raise RuntimeError(f"Training command failed with return code {p.returncode}.")
-            process_list = [p for p in process_list if p.poll() is None]
-            # check every few seconds
-            time.sleep(5)
+        process_manager.wait_all()
     finally:
-        for p in process_list:
-            if p.poll() is None:
-                p.kill()
-        ACTIVE_PROCESSES[:] = [p for p in ACTIVE_PROCESSES if p.poll() is None]
+        process_manager.terminate_all()
 
     # evaluate: average of results per combination and ensemble
     for name, grid_config in config_dict["grids"].items():
+        _, comb_dict = grid_search_combinations(grid_config)
         for lang in config_dict["data"]["languages"]:
 
             results = []  # average of single models
@@ -206,24 +409,55 @@ def main(args: argparse.Namespace):
                 f"{config_dict['data']['path']}/{file_name_from_pattern(config_dict['data']['pattern'], lang, 'dev')}"
             test_file =\
                 f"{config_dict['data']['path']}/{file_name_from_pattern(config_dict['data']['pattern'], lang, 'test')}"
+            has_test = os.path.exists(test_file)
 
             # level: combination
-            for c_dir in os.listdir(output_path):  # c_dir == name of combination (number)
+            for c_dir in [str(i) for i in sorted(comb_dict)]:  # c_dir == name of combination (number)
                 dev_beam_avg, dev_greedy_avg = 0, 0
                 test_beam_avg, test_greedy_avg = 0, 0
+                c_dir_path = f"{output_path}/{c_dir}"  # directory of combination
+                combination = comb_dict[int(c_dir)]
+                run_dirs = [
+                    f"{c_dir}.{i}"
+                    for i in range(1, config_dict["runs_per_model"] + 1)
+                ]
+                n_runs = len(run_dirs)
 
-                # get beam size
-                c_first_run = os.listdir(f"{output_path}/{c_dir}")[0]
-                beam_match = re.search(r"beam[0-9]+", " ".join(os.listdir(f"{output_path}/{c_dir}/{c_first_run}")))
-                beam_width = beam_match[0] if beam_match else None
-
-                # check if test files are evaluated
-                test_match = "test_greedy.eval" in " ".join(os.listdir(f"{output_path}/{c_dir}/{c_first_run}"))
+                beam_width = beam_width_from_combination(combination)
+                expected_files = [
+                    f"{c_dir_path}/{c_run}/dev_greedy.eval"
+                    for c_run in run_dirs
+                ]
+                if beam_width:
+                    expected_files.extend(
+                        f"{c_dir_path}/{c_run}/dev_{beam_width}.eval"
+                        for c_run in run_dirs
+                    )
+                if has_test:
+                    expected_files.extend(
+                        f"{c_dir_path}/{c_run}/test_greedy.eval"
+                        for c_run in run_dirs
+                    )
+                    if beam_width:
+                        expected_files.extend(
+                            f"{c_dir_path}/{c_run}/test_{beam_width}.eval"
+                            for c_run in run_dirs
+                        )
+                if args.ensemble:
+                    for split in ["dev", "test"] if has_test else ["dev"]:
+                        expected_files.extend(
+                            f"{c_dir_path}/{c_run}/{split}_greedy.predictions"
+                            for c_run in run_dirs
+                        )
+                        if beam_width:
+                            expected_files.extend(
+                                f"{c_dir_path}/{c_run}/{split}_{beam_width}.predictions"
+                                for c_run in run_dirs
+                            )
+                require_files(expected_files)
 
                 # level: run per combination
-                c_dir_path = f"{output_path}/{c_dir}"  # directory of combination
-                n_runs = len(os.listdir(c_dir_path))  # number of runs for combination
-                for c_run in os.listdir(c_dir_path):
+                for c_run in run_dirs:
                     # dev greedy
                     dev_greedy_avg += last_value_from_file(f"{c_dir_path}/{c_run}/dev_greedy.eval")/n_runs
 
@@ -231,7 +465,7 @@ def main(args: argparse.Namespace):
                     if beam_width:
                         dev_beam_avg += last_value_from_file(f"{c_dir_path}/{c_run}/dev_{beam_width}.eval")/n_runs
 
-                    if test_match:
+                    if has_test:
                         # test greedy
                         test_greedy_avg += last_value_from_file(f"{c_dir_path}/{c_run}/test_greedy.eval")/n_runs
                         # test beam
@@ -240,24 +474,26 @@ def main(args: argparse.Namespace):
 
                 result = {
                     'c_dir': c_dir,
+                    'beam_width': beam_width,
                     'dev_greedy': round(dev_greedy_avg, 4),
                     'dev_beam': round(dev_beam_avg, 4) if beam_width else None,
-                    'test_greedy': round(test_greedy_avg, 4) if test_match else None,
-                    'test_beam': round(test_beam_avg, 4) if test_match and beam_width else None
+                    'test_greedy': round(test_greedy_avg, 4) if has_test else None,
+                    'test_beam': round(test_beam_avg, 4) if has_test and beam_width else None
                 }
                 results.append(result)
 
                 if args.ensemble:
                     result = {
                         'c_dir': c_dir,
+                        'beam_width': beam_width,
                         'dev_beam': None,
                         'test_greedy': None,
                         'test_beam': None
                     }
-                    golds = [('dev', dev_file), ('test', test_file)] if test_match else [('dev', dev_file)]
+                    golds = [('dev', dev_file), ('test', test_file)] if has_test else [('dev', dev_file)]
                     for split, gold_file in golds:
                         systems =\
-                            [f"{c_dir_path}/{c_dir}.{i}/{split}_greedy.predictions" for i in range(1, n_runs+1)]
+                            [f"{c_dir_path}/{c_run}/{split}_greedy.predictions" for c_run in run_dirs]
                         # greedy
                         run_ensemble(gold_file, systems, f"{c_dir_path}/greedy_ensemble")
                         result[f"{split}_greedy"] =\
@@ -265,17 +501,17 @@ def main(args: argparse.Namespace):
                         # beam
                         if beam_width:
                             systems = \
-                                [f"{c_dir_path}/{c_dir}.{i}/{split}_{beam_width}.predictions" for i in range(1, n_runs + 1)]
+                                [f"{c_dir_path}/{c_run}/{split}_{beam_width}.predictions" for c_run in run_dirs]
                             run_ensemble(gold_file, systems, f"{c_dir_path}/{beam_width}_ensemble")
                             result[f"{split}_beam"] = \
                                 round(last_value_from_file(f"{c_dir_path}/{beam_width}_ensemble/{split}_{n_runs}ensemble.eval"), 4)
                     ensemble_results.append(result)
 
             # write to results text file
-            write_to_results_file(f"{args.output}/{name}/{lang}/results.txt", results, beam_width)
+            write_to_results_file(f"{args.output}/{name}/{lang}/results.txt", results)
 
             if args.ensemble:
-                write_to_results_file(f"{args.output}/{name}/{lang}/ensemble_results.txt", ensemble_results, beam_width)
+                write_to_results_file(f"{args.output}/{name}/{lang}/ensemble_results.txt", ensemble_results)
 
 
 def cli_main():
@@ -287,7 +523,7 @@ def cli_main():
     parser.add_argument("--output", type=str, required=True,
                         help="Path to output directory.")
     parser.add_argument("--parallel-jobs", type=int,
-                        default=30, help="Max number of parallel trainings.")
+                        help="Max number of parallel trainings. Defaults to 30 for CPU-only grids and 4 if any grid uses a non-CPU device.")
     parser.add_argument("--ensemble", action="store_true",
                         help="Produce ensemble results.")
 
