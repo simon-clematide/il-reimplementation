@@ -21,7 +21,7 @@ We received some requests to share our models from our successful submission to 
 So if you want to use these models with this package, have a look at [this repository](https://github.com/slvnwhrl/sigmorphon2022-models) where we host the models.
 
 ## Installation
-Please make sure that you are using Python 3.13.
+Please make sure that you are using Python 3.10 or newer, up to Python 3.13.
 To install this package, perform the following steps:
 
 * Clone the repository and change to the package directory:
@@ -29,9 +29,9 @@ To install this package, perform the following steps:
         git clone https://github.com/slvnwhrl/il-reimplementation.git neural_transducer
         cd neural_transducer
 
-* Create and activate a Python 3.13 virtual environment:
+* Create and activate a supported Python virtual environment:
 
-        python3.13 -m venv .venv
+        python3 -m venv .venv
         source .venv/bin/activate
 
 * Install the package and its runtime dependencies:
