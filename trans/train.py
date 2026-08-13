@@ -500,19 +500,20 @@ def cli_main():
     logging.basicConfig(level="INFO", format="%(levelname)s: %(message)s")
 
     parser = argparse.ArgumentParser(
-        description="Train a g2p neural transducer.")
+        description="Train a g2p neural transducer.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     parser.add_argument("--pytorch-seed", type=int,
                         help="Random seed used by PyTorch.")
     parser.add_argument("--train", type=str,
                         help="Path to train set data. Only required if --precomputed-train and --vocabulary is not"
-                             "provided.")
+                             " provided.")
     parser.add_argument("--precomputed-train", type=str,
                         help="Path to precomputed train set data. "
                              "If provided, --vocabulary option must be provided, as well.")
     parser.add_argument("--save-precomputed-train", action="store_true", default=False,
                         help="Store the precomputed training set (i.e., containing the expert's information needed"
-                             "for training). Can be used to speed up the training process for large datasets.")
+                             " for training). Can be used to speed up the training process for large datasets.")
     parser.add_argument("--vocabulary", type=str,
                         help="Path to the vocabulary. "
                              "If provided, --precomputed-train must be provided, as well.")
@@ -528,7 +529,7 @@ def cli_main():
                         help="Character peak_embedding dimension.")
     parser.add_argument("--feat-dim", type=int, default=None,
                         help="Feature embedding dimension, if any."
-                             "The data is assumed to be in UniMorph format.")
+                             " The data is assumed to be in UniMorph format.")
     parser.add_argument("--action-dim", type=int, default=100,
                         help="Action peak_embedding dimension.")
     parser.add_argument("--enc-type", type=str, default='lstm',
@@ -550,7 +551,7 @@ def cli_main():
                         help="Batch size for training.")
     parser.add_argument("--eval-batch-size", type=int,
                         help="Batch size for evaluation. Will be set to training batch size (--batch-size) if not"
-                             "specified.")
+                             " specified.")
     parser.add_argument("--loss-reduction", type=str, default="mean", choices=["sum", "mean"],
                         help="How the loss is reduced during training.")
     parser.add_argument("--grad-accumulation", type=int, default=1,
