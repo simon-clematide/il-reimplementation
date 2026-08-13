@@ -82,6 +82,10 @@ class StochasticEditDistance(actions.Aligner):
             target_alphabet: Characters of all target strings.
             copy_probability: On weight init, how much mass to give to copy
                 edits."""
+        if copy_probability is not None and not 0 < copy_probability < 1:
+            raise ValueError(
+                f"0 < copy probability={copy_probability} < 1 doesn\'t hold.")
+
         source_alphabet = set(source_alphabet)
         target_alphabet = set(target_alphabet)
 
@@ -94,14 +98,11 @@ class StochasticEditDistance(actions.Aligner):
             uniform_weight = np.log(1 / n)
             log_copy_prob = uniform_weight  # probability of a copy action
             log_rest_prob = uniform_weight  # probability of any other action
-        elif 0 < copy_probability < 1:
+        else:
             # split copy mass over individual copy actions
             num_rest = n - num_copy_edits
             log_copy_prob = np.log(copy_probability / num_copy_edits)
             log_rest_prob = np.log((1 - copy_probability) / num_rest)
-        else:
-            raise ValueError(
-                f"0 < copy probability={copy_probability} < 1 doesn\'t hold.")
 
         delta_sub = {(s, t): log_copy_prob if s == t else log_rest_prob
                      for s in source_alphabet for t in target_alphabet}
