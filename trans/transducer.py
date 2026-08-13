@@ -23,6 +23,11 @@ MAX_ACTION_SEQ_LEN = 150
 @functools.total_ordering
 @dataclasses.dataclass
 class Output:
+    """Decoded output.
+
+    For greedy decoding, ``log_p`` is normalized over generated actions,
+    including END_WORD and excluding BEGIN_WORD.
+    """
     action_history: List[Any]
     output: Union[str, List[str]]
     log_p: float
@@ -141,7 +146,14 @@ class Transducer(torch.nn.Module):
                 alignment_update[i] = 1
         self.alignment_update = torch.tensor(alignment_update, device=self.device)
 
-        self.valid_actions_lookup: Dict[int, torch.tensor] = {}
+        self.register_buffer(
+            "valid_actions_exhausted",
+            self.compute_valid_actions(1),
+        )
+        self.register_buffer(
+            "valid_actions_available",
+            self.compute_valid_actions(2),
+        )
 
     @property
     def h0_c0(self):
@@ -223,13 +235,22 @@ class Transducer(torch.nn.Module):
         return valid_actions
 
     def valid_actions_for_suffixes(self, suffix_lengths: torch.tensor) -> torch.tensor:
-        masks = []
-        for length in suffix_lengths.detach().cpu().reshape(-1).tolist():
-            length = max(int(length), 0)
-            if length not in self.valid_actions_lookup:
-                self.valid_actions_lookup[length] = self.compute_valid_actions(length)
-            masks.append(self.valid_actions_lookup[length])
-        return torch.stack(masks, dim=0).unsqueeze(dim=0)
+        has_input = suffix_lengths.reshape(-1).to(self.device) > 1
+        return torch.where(
+            has_input.unsqueeze(dim=1),
+            self.valid_actions_available.unsqueeze(dim=0),
+            self.valid_actions_exhausted.unsqueeze(dim=0),
+        ).unsqueeze(dim=0)
+
+    @staticmethod
+    def trim_encoded_action_history(action_history: torch.tensor) -> List[List[int]]:
+        trimmed = []
+        for seq in action_history.squeeze(dim=0).cpu().tolist():
+            if END_WORD in seq:
+                trimmed.append(seq[1:seq.index(END_WORD) + 1])
+            else:
+                trimmed.append(seq[1:])
+        return trimmed
 
     @staticmethod
     def sample(log_probs: np.array) -> int:
@@ -491,6 +512,8 @@ class Transducer(torch.nn.Module):
         action_history = torch.tensor([[[BEGIN_WORD]] * batch_size],
                                       device=self.device, dtype=torch.int)
         log_p = torch.full((1, batch_size), 0.0, device=self.device)
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+        action_lengths = torch.zeros(batch_size, dtype=torch.long, device=self.device)
         true_input_lengths = torch.tensor(
             # +1 because end word is not included in input
             [len(i) + 1 for i in input_], device=self.device)
@@ -504,12 +527,8 @@ class Transducer(torch.nn.Module):
         # initial cell state for decoder
         decoder = self.h0_c0
 
-        # decoding is continued until all sequences
-        # in the batch have "found" an end word
-        def continue_decoding():
-            return torch.any(action_history == END_WORD, dim=2).sum() < batch_size
-
-        while continue_decoding() and action_history.size(2) <= MAX_ACTION_SEQ_LEN:
+        while not torch.all(finished) and action_history.size(2) <= MAX_ACTION_SEQ_LEN:
+            active = ~finished
             valid_actions_mask = self.valid_actions_for_suffixes(true_input_lengths - alignment)
 
             # run decoder
@@ -519,25 +538,31 @@ class Transducer(torch.nn.Module):
 
             # get actions
             actions, log_probs = self.calculate_actions(decoder_output, valid_actions_mask)
+            action_ids = actions.squeeze(dim=0)
 
             # update states
-            log_p += log_probs[:, torch.arange(batch_size, device=self.device), actions.squeeze(dim=0)]
+            selected_log_probs = log_probs[
+                0,
+                torch.arange(batch_size, device=self.device),
+                action_ids,
+            ]
+            log_p[0, active] += selected_log_probs[active]
+            action_lengths[active] += 1
             action_history = torch.cat(
                 (action_history, actions.unsqueeze(dim=2)),
                 dim=2
             )
-            alignment = alignment + self.alignment_update[actions.squeeze(dim=0)]
+            alignment = alignment + self.alignment_update[action_ids] * active
+            finished = finished | (active & (action_ids == END_WORD))
 
         # adjust log_p
-        # --> return the token avg. of all seqs in the batch
-        true_action_lengths = action_history.size(2) - (action_history == PAD).sum(dim=2)
-        log_p = torch.mean(log_p.sum(dim=0) / true_action_lengths).item()
+        # --> return the generated-action avg. of all seqs in the batch
+        log_p = torch.mean(log_p.squeeze(dim=0) / action_lengths).item()
 
         # trim action history
         # --> first element is not considered (begin-of-sequence-token)
         # --> and only token up to the first end-of-sequence-token (as encoded integer output, including it)
-        action_history = [seq[1:(seq.index(END_WORD) + 1 if END_WORD in seq else -1)]
-                          for seq in action_history.squeeze(dim=0).cpu().tolist()]
+        action_history = self.trim_encoded_action_history(action_history)
 
         return Output(action_history, self.decode_encoded_output(input_, action_history),
                       log_p, None)
