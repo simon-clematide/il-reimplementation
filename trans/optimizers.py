@@ -22,11 +22,16 @@ class Adam(torch.optim.Adam):
 
     @staticmethod
     def add_args(parser: argparse.ArgumentParser) -> None:
-        parser.add_argument("--lr", type=float, default=0.001)
-        parser.add_argument("--betas", type=float, nargs=2, default=(0.9, 0.999))
-        parser.add_argument("--eps", type=float, default=1e-08)
-        parser.add_argument("--weight-decay", type=float, default=0)
-        parser.add_argument("--amsgrad", action=argparse.BooleanOptionalAction, default=False)
+        parser.add_argument("--lr", type=float, default=0.001,
+                            help="Learning rate.")
+        parser.add_argument("--betas", type=float, nargs=2, default=(0.9, 0.999),
+                            help="Adam beta coefficients.")
+        parser.add_argument("--eps", type=float, default=1e-08,
+                            help="Adam epsilon.")
+        parser.add_argument("--weight-decay", type=float, default=0,
+                            help="Weight decay.")
+        parser.add_argument("--amsgrad", action=argparse.BooleanOptionalAction, default=False,
+                            help="Use the AMSGrad Adam variant.")
 
 
 @register_component('adamw', 'optimizer')
@@ -44,11 +49,16 @@ class AdamW(torch.optim.AdamW):
 
     @staticmethod
     def add_args(parser: argparse.ArgumentParser) -> None:
-        parser.add_argument("--lr", type=float, default=0.001)
-        parser.add_argument("--betas", type=float, nargs=2, default=(0.9, 0.999))
-        parser.add_argument("--opt-eps", type=float, default=1e-08)
-        parser.add_argument("--weight-decay", type=float, default=0)
-        parser.add_argument("--amsgrad", action=argparse.BooleanOptionalAction, default=False)
+        parser.add_argument("--lr", type=float, default=0.001,
+                            help="Learning rate.")
+        parser.add_argument("--betas", type=float, nargs=2, default=(0.9, 0.999),
+                            help="AdamW beta coefficients.")
+        parser.add_argument("--opt-eps", type=float, default=1e-08,
+                            help="AdamW epsilon.")
+        parser.add_argument("--weight-decay", type=float, default=0,
+                            help="Weight decay.")
+        parser.add_argument("--amsgrad", action=argparse.BooleanOptionalAction, default=False,
+                            help="Use the AMSGrad AdamW variant.")
 
 
 @register_component('adadelta', 'optimizer')
@@ -65,10 +75,14 @@ class Adadelta(torch.optim.Adadelta):
 
     @staticmethod
     def add_args(parser: argparse.ArgumentParser) -> None:
-        parser.add_argument("--lr", type=float, default=1.0)
-        parser.add_argument("--rho", type=float, default=0.9)
-        parser.add_argument("--opt-eps", type=float, default=1e-06)
-        parser.add_argument("--weight-decay", type=float, default=0.)
+        parser.add_argument("--lr", type=float, default=1.0,
+                            help="Learning rate.")
+        parser.add_argument("--rho", type=float, default=0.9,
+                            help="Adadelta coefficient for running average of squared gradients.")
+        parser.add_argument("--opt-eps", type=float, default=1e-06,
+                            help="Adadelta epsilon.")
+        parser.add_argument("--weight-decay", type=float, default=0.,
+                            help="Weight decay.")
 
 
 @register_component('inv_sr', 'lr_scheduler')
@@ -93,8 +107,10 @@ class WarmupInverseSquareRootSchedule(torch.optim.lr_scheduler.LambdaLR):
 
     @staticmethod
     def add_args(parser: argparse.ArgumentParser) -> None:
-        parser.add_argument("--warmup-steps", type=int, default=20)
-        parser.add_argument("--last-epoch", type=int, default=-1)
+        parser.add_argument("--warmup-steps", type=int, default=20,
+                            help="Number of linear warmup steps.")
+        parser.add_argument("--last-epoch", type=int, default=-1,
+                            help="Index of the last epoch for scheduler state.")
 
 
 @register_component('reduce_on_plateau', 'lr_scheduler')
@@ -122,11 +138,19 @@ class ReduceLROnPlateau(torch.optim.lr_scheduler.ReduceLROnPlateau):
 
     @staticmethod
     def add_args(parser: argparse.ArgumentParser) -> None:
-        parser.add_argument("--factor", type=float, default=0.1)
-        parser.add_argument("--lrs-patience", type=int, default=10)
-        parser.add_argument("--threshold", type=float, default=1e-4)
-        parser.add_argument("--threshold-mode", type=str, default='rel')
-        parser.add_argument("--cooldown", type=int, default=0)
-        parser.add_argument("--min-lr", type=float, default=0.)
-        parser.add_argument("--lrs-eps", type=float, default=1e-8)
-        parser.add_argument("--verbose", action=argparse.BooleanOptionalAction, default=False)
+        parser.add_argument("--factor", type=float, default=0.5,
+                            help="Factor by which to reduce the learning rate.")
+        parser.add_argument("--lrs-patience", type=int, default=2,
+                            help="Number of unimproved epochs before reducing learning rate.")
+        parser.add_argument("--threshold", type=float, default=1e-4,
+                            help="Threshold for measuring metric improvement.")
+        parser.add_argument("--threshold-mode", type=str, default='rel',
+                            help="Threshold mode for plateau detection.")
+        parser.add_argument("--cooldown", type=int, default=0,
+                            help="Cooldown epochs after reducing learning rate.")
+        parser.add_argument("--min-lr", type=float, default=0.,
+                            help="Lower bound for learning rate.")
+        parser.add_argument("--lrs-eps", type=float, default=1e-8,
+                            help="Minimum learning-rate change.")
+        parser.add_argument("--verbose", action=argparse.BooleanOptionalAction, default=False,
+                            help="Print scheduler messages when supported by installed PyTorch.")
