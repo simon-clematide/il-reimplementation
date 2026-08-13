@@ -44,6 +44,24 @@ def should_stop_for_patience(patience: int, max_patience: int) -> bool:
     return patience >= max_patience
 
 
+def optimizer_learning_rates(optimizer: torch.optim.Optimizer) -> list[float]:
+    return [param_group["lr"] for param_group in optimizer.param_groups]
+
+
+def log_learning_rate_change(
+        before: list[float],
+        optimizer: torch.optim.Optimizer,
+        scheduler_name: str) -> None:
+    after = optimizer_learning_rates(optimizer)
+    if before != after:
+        logging.info(
+            "Learning rate changed by %s scheduler: %s -> %s.",
+            scheduler_name,
+            before,
+            after,
+        )
+
+
 def current_git_commit() -> str:
     try:
         return subprocess.check_output(
@@ -398,7 +416,9 @@ def main(args: argparse.Namespace):
                 if should_step(j, batch_count, args.grad_accumulation):
                     optimizer.step()
                     if scheduler is not None and scheduler.type == 'step':
+                        lrs_before = optimizer_learning_rates(optimizer)
                         scheduler.step()
+                        log_learning_rate_change(lrs_before, optimizer, args.scheduler)
                     optimizer.zero_grad(set_to_none=True)
                 if j > 0 and j % 100 == 0:
                     logging.info("\t\t...%d batches", j)
@@ -426,7 +446,9 @@ def main(args: argparse.Namespace):
                 avg_dev_loss = decoding_output.loss
 
         if scheduler is not None and scheduler.type == 'metric':
+            lrs_before = optimizer_learning_rates(optimizer)
             scheduler.step(dev_accuracy)
+            log_learning_rate_change(lrs_before, optimizer, args.scheduler)
 
         if dev_accuracy > best_dev_accuracy:
             best_dev_accuracy = dev_accuracy
@@ -580,7 +602,29 @@ def cli_main():
     parser.add_argument("--device", type=str, default='cpu',
                         help="Device to run training on.")
 
-    args, _ = parser.parse_known_args()
+    preliminary_parser = argparse.ArgumentParser(add_help=False)
+    preliminary_parser.add_argument("--enc-type", type=str, default='lstm',
+                                    choices=ENCODER_MAPPING.keys())
+    preliminary_parser.add_argument("--optimizer", type=str, default="adadelta",
+                                    choices=OPTIMIZER_MAPPING.keys())
+    preliminary_parser.add_argument("--scheduler", type=str,
+                                    choices=LR_SCHEDULER_MAPPING.keys())
+    preliminary_args, _ = preliminary_parser.parse_known_args()
+
+    # encoder-specific configs
+    encoder_group = parser.add_argument_group("Encoder specific configuration")
+    ENCODER_MAPPING[preliminary_args.enc_type].add_args(encoder_group)
+
+    # optimizer-specific configs
+    optimizer_group = parser.add_argument_group("Optimizer specific configuration")
+    OPTIMIZER_MAPPING[preliminary_args.optimizer].add_args(optimizer_group)
+
+    # scheduler-specific configs
+    if preliminary_args.scheduler is not None:
+        scheduler_group = parser.add_argument_group("LR scheduler specific configuration")
+        LR_SCHEDULER_MAPPING[preliminary_args.scheduler].add_args(scheduler_group)
+
+    args = parser.parse_args()
 
     # custom logic for handling mutually inclusive/exclusive set of options
     # --> train, precomputed_train and vocabulary
@@ -598,20 +642,6 @@ def cli_main():
             args.precomputed_train is not None and args.vocabulary is not None:
         parser.error("If --train is specified, --precomputed-train and --vocabulary should not be provided.")
 
-    # encoder-specific configs
-    encoder_group = parser.add_argument_group("Encoder specific configuration")
-    ENCODER_MAPPING[args.enc_type].add_args(encoder_group)
-
-    # optimizer-specific configs
-    optimizer_group = parser.add_argument_group("Optimizer specific configuration")
-    OPTIMIZER_MAPPING[args.optimizer].add_args(optimizer_group)
-
-    # scheduler-specific configs
-    if args.scheduler is not None:
-        scheduler_group = parser.add_argument_group("LR scheduler specific configuration")
-        LR_SCHEDULER_MAPPING[args.scheduler].add_args(scheduler_group)
-
-    args = parser.parse_args()
     main(args)
 
 

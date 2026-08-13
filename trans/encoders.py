@@ -30,7 +30,7 @@ class LSTMEncoder(torch.nn.LSTM):
                             help="If LSTM is bidirectional.")
         parser.add_argument("--enc-dropout", type=float, default=0.,
                             help="Dropout probability after each LSTM layer"
-                                 "(except the last layer).")
+                                 " (except the last layer).")
 
     @property
     def output_size(self):
@@ -80,7 +80,7 @@ class TransformerEncoder(torch.nn.Module):
         parser.add_argument("--enc-nhead", type=int, default=4,
                             help="Number of Transformer heads.")
         parser.add_argument("--enc-dim-feedforward", type=int, default=1024,
-                            help="Number of Transformer heads.")
+                            help="Transformer feedforward dimension.")
         parser.add_argument("--enc-dropout", type=float, default=0.1,
                             help="Dropout probability.")
 

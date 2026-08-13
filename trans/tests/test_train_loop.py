@@ -154,6 +154,39 @@ class TestGradientAccumulation(unittest.TestCase):
         with self.assertRaises(ValueError):
             train.should_stop_for_patience(0, 0)
 
+    def test_optimizer_learning_rates_reports_all_param_groups(self):
+        model = torch.nn.Linear(1, 1)
+        optimizer = torch.optim.SGD(
+            [
+                {"params": [model.weight], "lr": 0.1},
+                {"params": [model.bias], "lr": 0.01},
+            ],
+        )
+
+        self.assertEqual([0.1, 0.01], train.optimizer_learning_rates(optimizer))
+
+    def test_log_learning_rate_change_logs_actual_change(self):
+        model = torch.nn.Linear(1, 1)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        before = train.optimizer_learning_rates(optimizer)
+        optimizer.param_groups[0]["lr"] = 0.05
+
+        with self.assertLogs(level="INFO") as logs:
+            train.log_learning_rate_change(before, optimizer, "reduce_on_plateau")
+
+        self.assertIn(
+            "Learning rate changed by reduce_on_plateau scheduler: [0.1] -> [0.05].",
+            logs.output[0],
+        )
+
+    def test_log_learning_rate_change_is_quiet_without_change(self):
+        model = torch.nn.Linear(1, 1)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        before = train.optimizer_learning_rates(optimizer)
+
+        with self.assertNoLogs(level="INFO"):
+            train.log_learning_rate_change(before, optimizer, "reduce_on_plateau")
+
 
 if __name__ == "__main__":
     unittest.main()
