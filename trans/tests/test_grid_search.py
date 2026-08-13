@@ -23,6 +23,11 @@ class TestGridSearchCommands(unittest.TestCase):
 
         self.assertEqual(["--beam-width", "4", "--enc-type", "lstm"], args)
 
+    def test_build_option_args_emits_negative_true_default_boolean(self):
+        args = grid_search.build_option_args({"enc-bidirectional": False})
+
+        self.assertEqual(["--no-enc-bidirectional"], args)
+
     def test_build_option_args_emits_true_booleans(self):
         args = grid_search.build_option_args({"nfd": True})
 
