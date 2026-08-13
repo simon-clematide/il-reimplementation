@@ -325,7 +325,8 @@ class Transducer(torch.nn.Module):
         paddings = ~torch.any(optimal_actions_mask, dim=2)
         logits_valid[paddings] = -np.inf
         logits_optimal = logits_valid.clone()
-        logits_optimal[~(valid_actions_mask * optimal_actions_mask)] = -np.inf
+        valid_optimal_actions = valid_actions_mask & optimal_actions_mask
+        logits_optimal[~valid_optimal_actions] = -np.inf
 
         log_sum_selected_terms = torch.logsumexp(
             logits_optimal,
