@@ -84,20 +84,4 @@ This matters for the Colab notebook because installing from Git via pip will
 use the PEP 517 project metadata and may not install everything needed by
 `trans-train`.
 
-## Review Context
-
-Recent review targets identified in this codebase:
-
-- `trans/train.py`: gradient accumulation currently steps on batch index `0`
-  and can miss the trailing accumulated gradients.
-- `trans/grid_search.py`: ensemble subprocess command construction is missing a
-  comma after `"trans-ensemble"`.
-- `trans/utils.py`: `Dataset.to()` does not move `encoded_features`, which can
-  break feature-based precomputed training on CUDA.
-- `trans/transducer.py`: `valid_actions_lookup` is built for a fixed range of
-  `MAX_INPUT_SEQ_LEN = 100`, but decoding can index one past that for
-  99-character inputs.
-- `notebooks/g2p.ipynb`: the notebook is Colab/GPU-oriented and assumes
-  `--device cuda`; add CPU fallback or a runtime check before making it a robust
-  teaching/application notebook.
 
