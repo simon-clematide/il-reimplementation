@@ -101,8 +101,3 @@ Recent review targets identified in this codebase:
   `--device cuda`; add CPU fallback or a runtime check before making it a robust
   teaching/application notebook.
 
-## Local State Notes
-
-At the time this file was created, `notebooks/` and `requirements.txt` were
-untracked in Git. Treat untracked or modified files as user work unless the user
-explicitly asks to stage, commit, or revert them.
