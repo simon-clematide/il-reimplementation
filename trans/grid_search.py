@@ -19,6 +19,9 @@ LANGUAGE_SPECIFIC_PARAMETERS = {
     "precomputed-train",
     "vocabulary",
 }
+TRUE_DEFAULT_BOOLEAN_PARAMETERS = {
+    "enc-bidirectional",
+}
 CPU_PARALLEL_JOBS_DEFAULT = 30
 ACCELERATOR_PARALLEL_JOBS_DEFAULT = 4
 
@@ -270,6 +273,8 @@ def build_option_args(config: dict) -> List[str]:
         if isinstance(par_value, bool):
             if par_value:
                 parsed_args.append(f"--{par_name}")
+            elif par_name in TRUE_DEFAULT_BOOLEAN_PARAMETERS:
+                parsed_args.append(f"--no-{par_name}")
         elif isinstance(par_value, (list, tuple)):
             parsed_args.extend([f"--{par_name}", *[str(v) for v in par_value]])
         elif par_name in ['sed-params', 'precomputed-train', 'vocabulary']:
