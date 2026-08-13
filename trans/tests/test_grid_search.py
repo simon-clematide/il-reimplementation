@@ -56,6 +56,8 @@ class TestGridSearchCommands(unittest.TestCase):
             grid_search.beam_width_from_combination({"beam-width": "foo"})
         with self.assertRaisesRegex(ValueError, "nonnegative integer"):
             grid_search.beam_width_from_combination({"beam-width": 2.5})
+        with self.assertRaisesRegex(ValueError, "nonnegative integer"):
+            grid_search.beam_width_from_combination({"beam-width": True})
 
     def test_default_parallel_jobs_depends_on_configured_device(self):
         self.assertEqual(
@@ -195,6 +197,7 @@ class TestGridSearchCommands(unittest.TestCase):
                 {
                     "c_dir": "1",
                     "beam_width": "beam2",
+                    "dev_greedy_mean": 0.2,
                     "dev_greedy": 0.2,
                     "dev_beam": 0.25,
                     "test_greedy": None,
@@ -203,6 +206,7 @@ class TestGridSearchCommands(unittest.TestCase):
                 {
                     "c_dir": "2",
                     "beam_width": "beam5",
+                    "dev_greedy_mean": 0.3,
                     "dev_greedy": 0.3,
                     "dev_beam": 0.35,
                     "test_greedy": None,
@@ -223,6 +227,7 @@ class TestGridSearchCommands(unittest.TestCase):
                 {
                     "c_dir": "1",
                     "beam_width": "beam2",
+                    "dev_greedy_mean": 0.0,
                     "dev_greedy": 0.0,
                     "dev_beam": 0.0,
                     "test_greedy": 0.0,
@@ -291,6 +296,83 @@ class TestGridSearchCommands(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unknown languages"):
                 grid_search.validate_config(config)
 
+    def test_validate_config_rejects_non_mapping_language_specific_parameters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for split in ("train", "dev"):
+                with open(os.path.join(tmp, f"ita.{split}.tsv"), "w") as f:
+                    f.write("a\ta\n")
+            config = {
+                "runs_per_model": 1,
+                "data": {
+                    "path": tmp,
+                    "pattern": "LANG.SPLIT.tsv",
+                    "languages": ["ita"],
+                },
+                "grids": {
+                    "grid": {
+                        "beam-width": [0],
+                        "sed-params": "ita.pkl",
+                    },
+                },
+            }
+
+            with self.assertRaisesRegex(ValueError, "must map language names"):
+                grid_search.validate_config(config)
+
+    def test_validate_config_rejects_seed_count_mismatch_or_seed_grid_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for split in ("train", "dev"):
+                with open(os.path.join(tmp, f"ita.{split}.tsv"), "w") as f:
+                    f.write("a\ta\n")
+            config = {
+                "runs_per_model": 2,
+                "seeds": [1],
+                "data": {
+                    "path": tmp,
+                    "pattern": "LANG.SPLIT.tsv",
+                    "languages": ["ita"],
+                },
+                "grids": {"grid": {"beam-width": [0]}},
+            }
+            with self.assertRaisesRegex(ValueError, "len\\(seeds\\)"):
+                grid_search.validate_config(config)
+
+            config["seeds"] = [1, 2]
+            config["grids"]["grid"]["pytorch-seed"] = [3, 4]
+            with self.assertRaisesRegex(ValueError, "top-level seeds"):
+                grid_search.validate_config(config)
+
+    def test_validate_config_rejects_non_integer_seeds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for split in ("train", "dev"):
+                with open(os.path.join(tmp, f"ita.{split}.tsv"), "w") as f:
+                    f.write("a\ta\n")
+            base_config = {
+                "runs_per_model": 1,
+                "data": {
+                    "path": tmp,
+                    "pattern": "LANG.SPLIT.tsv",
+                    "languages": ["ita"],
+                },
+                "grids": {"grid": {"beam-width": [0]}},
+            }
+            for bad_seeds in ("1", {"ita": 1}, [True], [1.5], ["1"]):
+                with self.subTest(seeds=bad_seeds):
+                    config = dict(base_config)
+                    config["seeds"] = bad_seeds
+                    with self.assertRaisesRegex(ValueError, "integer seeds"):
+                        grid_search.validate_config(config)
+
+    def test_format_score_summary_uses_sample_sd_and_single_replicate_zero(self):
+        self.assertEqual(
+            "0.3000 ± 0.1414",
+            grid_search.format_score_summary([0.2, 0.4]),
+        )
+        self.assertEqual(
+            "0.2000 ± 0.0000",
+            grid_search.format_score_summary([0.2]),
+        )
+
     def test_main_evaluation_ignores_ensemble_directories_in_run_count(self):
         with tempfile.TemporaryDirectory() as tmp:
             config_path = os.path.join(tmp, "config.json")
@@ -341,8 +423,80 @@ class TestGridSearchCommands(unittest.TestCase):
             with open(os.path.join(output, "grid", "ita", "results.txt")) as f:
                 contents = f.read()
 
-        self.assertIn("greedy: 0.3", contents)
-        self.assertIn("beam3: 0.3", contents)
+        self.assertIn("greedy: 0.3000 ± 0.1414", contents)
+        self.assertIn("beam3: 0.3000 ± 0.1414", contents)
+
+    def test_main_persists_resolved_config_next_to_combinations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, "config.json")
+            output = os.path.join(tmp, "output")
+            data_dir = os.path.join(tmp, "data")
+            os.makedirs(data_dir)
+            for split in ("train", "dev"):
+                with open(os.path.join(data_dir, f"ita.{split}.tsv"), "w") as f:
+                    f.write("a\ta\n")
+            config = {
+                "runs_per_model": 1,
+                "seeds": [41],
+                "data": {
+                    "path": data_dir,
+                    "pattern": "LANG.SPLIT.tsv",
+                    "languages": ["ita"],
+                },
+                "grids": {"grid": {"beam-width": [0]}},
+            }
+            with open(config_path, "w") as f:
+                json.dump(config, f)
+
+            run_dir = os.path.join(output, "grid", "ita", "1", "1.1")
+            os.makedirs(run_dir)
+            with open(os.path.join(run_dir, "dev_greedy.eval"), "w") as f:
+                f.write("accuracy 0.2\n")
+
+            process = mock.Mock()
+            process.poll.return_value = 0
+            process.returncode = 0
+            args = argparse.Namespace(
+                config=config_path,
+                output=output,
+                parallel_jobs=1,
+                ensemble=False,
+            )
+
+            with mock.patch.object(grid_search.subprocess, "Popen", return_value=process):
+                grid_search.main(args)
+
+            with open(os.path.join(output, "grid", "config.json")) as f:
+                saved_config = json.load(f)
+            self.assertEqual(config, saved_config)
+            self.assertTrue(os.path.isfile(
+                os.path.join(output, "grid", "combinations.json")))
+            with open(os.path.join(output, "grid", "run_metadata.json")) as f:
+                run_metadata = json.load(f)
+            self.assertEqual(
+                {"parallel_jobs": 1, "ensemble": False},
+                run_metadata,
+            )
+
+    def test_write_experiment_metadata_records_resolved_runner_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {"runs_per_model": 1, "grids": {"grid": {"device": "mps"}}}
+            comb_dict = {1: {"device": "mps"}}
+            parallel_jobs = grid_search.default_parallel_jobs(config)
+
+            grid_search.write_experiment_metadata(
+                tmp, config, comb_dict, parallel_jobs, ensemble=True)
+
+            with open(os.path.join(tmp, "run_metadata.json")) as f:
+                metadata = json.load(f)
+            self.assertEqual({"parallel_jobs": 4, "ensemble": True}, metadata)
+
+            grid_search.write_experiment_metadata(
+                tmp, config, comb_dict, parallel_jobs=7, ensemble=False)
+
+            with open(os.path.join(tmp, "run_metadata.json")) as f:
+                metadata = json.load(f)
+            self.assertEqual({"parallel_jobs": 7, "ensemble": False}, metadata)
 
     def test_main_evaluation_requires_test_artifacts_when_test_data_exists(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -388,6 +542,73 @@ class TestGridSearchCommands(unittest.TestCase):
             with mock.patch.object(grid_search.subprocess, "Popen", return_value=process):
                 with self.assertRaisesRegex(FileNotFoundError, "test_greedy.eval"):
                     grid_search.main(args)
+
+    def test_main_adds_replicate_seed_for_each_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, "config.json")
+            output = os.path.join(tmp, "output")
+            data_dir = os.path.join(tmp, "data")
+            os.makedirs(data_dir)
+            for split in ("train", "dev"):
+                with open(os.path.join(data_dir, f"ita.{split}.tsv"), "w") as f:
+                    f.write("a\ta\n")
+            with open(config_path, "w") as f:
+                json.dump({
+                    "runs_per_model": 3,
+                    "seeds": [41, 42, 43],
+                    "data": {
+                        "path": data_dir,
+                        "pattern": "LANG.SPLIT.tsv",
+                        "languages": ["ita"],
+                    },
+                    "grids": {
+                        "grid": {
+                            "beam-width": [0],
+                        },
+                    },
+                }, f)
+
+            combo_dir = os.path.join(output, "grid", "ita", "1")
+            for run_name in ("1.1", "1.2", "1.3"):
+                run_dir = os.path.join(combo_dir, run_name)
+                os.makedirs(run_dir)
+                with open(os.path.join(run_dir, "dev_greedy.eval"), "w") as f:
+                    f.write("accuracy 0.2\n")
+
+            processes = []
+
+            def popen(command, bufsize=0):
+                process = mock.Mock()
+                process.poll.return_value = 0
+                process.returncode = 0
+                process.command = command
+                processes.append(process)
+                return process
+
+            args = argparse.Namespace(
+                config=config_path,
+                output=output,
+                parallel_jobs=1,
+                ensemble=False,
+            )
+
+            with mock.patch.object(grid_search.subprocess, "Popen", side_effect=popen):
+                grid_search.main(args)
+
+        commands = [process.command for process in processes]
+        self.assertIn("--pytorch-seed", commands[0])
+        self.assertEqual("41", commands[0][commands[0].index("--pytorch-seed") + 1])
+        self.assertEqual("42", commands[1][commands[1].index("--pytorch-seed") + 1])
+        self.assertEqual("43", commands[2][commands[2].index("--pytorch-seed") + 1])
+
+    def test_top_level_seeds_do_not_increase_combination_count(self):
+        args_list, comb_dict = grid_search.grid_search_combinations({
+            "beam-width": [0, 5],
+            "enc-type": "lstm",
+        })
+
+        self.assertEqual(2, len(args_list))
+        self.assertEqual(2, len(comb_dict))
 
 
 if __name__ == "__main__":
