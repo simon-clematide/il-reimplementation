@@ -243,6 +243,12 @@ class StochasticEditDistance(actions.Aligner):
             raise ValueError(f"Unknown EM mode: {mode}.")
         if not 0. < damping <= 1.:
             raise ValueError(f"EM damping must satisfy 0 < damping <= 1: {damping}.")
+        if len(sources) != len(targets):
+            raise ValueError(
+                f"SED EM requires the same number of sources and targets: "
+                f"{len(sources)} != {len(targets)}.")
+        if len(sources) == 0:
+            raise ValueError("Cannot train SED on an empty corpus.")
         effective_damping = damping if mode == "damped" else 1.
         logging.info(
             "Initial weighted LL=%.4f", self.log_likelihood(sources, targets))
