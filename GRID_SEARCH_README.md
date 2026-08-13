@@ -101,6 +101,34 @@ Unknown language keys are rejected during preflight validation, so a typo such
 as `"tia"` fails before jobs are launched. These values must be JSON objects
 mapping language names to file paths.
 
+## Example: One-Layer Locked Encoder Dropout
+
+This grid isolates explicit dropout on the LSTM encoder output sequence while
+leaving the historical PyTorch LSTM inter-layer dropout disabled. Locked dropout
+uses one feature mask per batch item and broadcasts it across all source
+positions.
+
+```json
+{
+  "data": {
+    "path": "data.d/sigmorphon2021/low",
+    "pattern": "LANG_SPLIT.tsv",
+    "languages": ["ita"]
+  },
+  "runs_per_model": 3,
+  "seeds": [1, 2, 3],
+  "grids": {
+    "one_layer_locked_output_dropout": {
+      "enc-type": "lstm",
+      "enc-layers": 1,
+      "enc-dropout": 0.0,
+      "enc-output-dropout": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5],
+      "enc-output-dropout-type": "locked"
+    }
+  }
+}
+```
+
 ## Example: CPU Sweep
 
 ```json

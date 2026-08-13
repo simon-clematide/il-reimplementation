@@ -1,16 +1,45 @@
 """Encoder classes used by the Transducer model."""
 import argparse
 import math
+import warnings
 from trans import register_component
 
 
 import torch
 
 
+class LockedDropout(torch.nn.Module):
+    """Dropout with one mask shared across the time dimension."""
+
+    def __init__(self, p: float = 0.) -> None:
+        super().__init__()
+        if p < 0. or p >= 1.:
+            raise ValueError(f"dropout probability has to satisfy 0 <= p < 1, but got {p}.")
+        self.p = p
+
+    def forward(self, input_: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.p == 0.:
+            return input_
+        keep_probability = 1. - self.p
+        mask = input_.new_empty(1, input_.size(1), input_.size(2))
+        mask.bernoulli_(keep_probability)
+        mask.div_(keep_probability)
+        return input_ * mask
+
+
 @register_component('lstm', 'encoder')
 class LSTMEncoder(torch.nn.LSTM):
     """LSTM-based encoder."""
     def __init__(self, args: argparse.Namespace):
+        if args.enc_layers == 1 and args.enc_dropout > 0:
+            warnings.warn(
+                "enc-dropout has no effect for a one-layer LSTM; PyTorch "
+                "applies LSTM dropout only between recurrent layers. Use "
+                "--enc-output-dropout for explicit dropout on the encoder "
+                "representation.",
+                UserWarning,
+                stacklevel=2,
+            )
         super().__init__(
             input_size=args.char_dim,
             hidden_size=args.enc_hidden_dim,
@@ -19,6 +48,20 @@ class LSTMEncoder(torch.nn.LSTM):
             dropout=args.enc_dropout,
             device=args.device
         )
+        if args.enc_output_dropout_type == "none":
+            self.output_dropout = torch.nn.Identity()
+        elif args.enc_output_dropout_type == "standard":
+            self.output_dropout = torch.nn.Dropout(args.enc_output_dropout)
+        elif args.enc_output_dropout_type == "locked":
+            self.output_dropout = LockedDropout(args.enc_output_dropout)
+        else:
+            raise ValueError(
+                f"Unsupported encoder output dropout type: {args.enc_output_dropout_type!r}.")
+
+    def forward(self, input, hx=None):
+        output, state = super().forward(input, hx)
+        output = self.output_dropout(output)
+        return output, state
 
     @staticmethod
     def add_args(parser: argparse.ArgumentParser) -> None:
@@ -31,6 +74,11 @@ class LSTMEncoder(torch.nn.LSTM):
         parser.add_argument("--enc-dropout", type=float, default=0.,
                             help="Dropout probability after each LSTM layer"
                                  " (except the last layer).")
+        parser.add_argument("--enc-output-dropout", type=float, default=0.,
+                            help="Dropout probability on the LSTM encoder output sequence.")
+        parser.add_argument("--enc-output-dropout-type", type=str, default="locked",
+                            choices=["none", "standard", "locked"],
+                            help="Dropout type for --enc-output-dropout.")
 
     @property
     def output_size(self):

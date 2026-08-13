@@ -64,6 +64,13 @@ The most important (and required) parameters are:
 
 For a full list of available training configurations, use ``trans-train --help``.
 
+For LSTM encoders, ``--enc-dropout`` is the legacy PyTorch inter-layer LSTM
+dropout. It only has an effect when ``--enc-layers`` is greater than 1. For
+explicit dropout on the encoder output sequence, including one-layer BiLSTMs,
+use ``--enc-output-dropout``. The default output-dropout type is locked dropout:
+
+        --enc-output-dropout 0.3 --enc-output-dropout-type locked
+
 SED parameters are estimated during training unless ``--sed-params`` points to
 an existing ``sed.pkl`` file. The default SED estimator is damped EM:
 

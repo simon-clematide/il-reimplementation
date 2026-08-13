@@ -35,6 +35,8 @@ class TransducerTests(unittest.TestCase):
             enc_layers=1,
             enc_bidirectional=True,
             enc_dropout=0.,
+            enc_output_dropout=0.,
+            enc_output_dropout_type="locked",
             dec_hidden_dim=100,
             dec_layers=1
         )
@@ -56,6 +58,8 @@ class TransducerTests(unittest.TestCase):
             enc_layers=1,
             enc_bidirectional=True,
             enc_dropout=0.,
+            enc_output_dropout=0.,
+            enc_output_dropout_type="locked",
             dec_hidden_dim=4,
             dec_layers=1
         )
