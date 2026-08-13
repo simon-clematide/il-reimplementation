@@ -21,7 +21,7 @@ ciao -> t͡ʃ a o
 can be explained by many different edit paths. SED gives a learned cost to
 those paths instead of requiring a fixed hand-written alignment.
 
-In code, SED is implemented in [trans/sed.py](/Users/siclemat/pj/2023/il-reimplementation/trans/sed.py). Its main class is
+In code, SED is implemented in [trans/sed.py](trans/sed.py). Its main class is
 `StochasticEditDistance`.
 
 ## Why SED is used
