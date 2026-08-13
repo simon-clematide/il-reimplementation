@@ -75,6 +75,18 @@ class TransducerTests(unittest.TestCase):
 
         self.assertEqual(torch.device("cpu"), valid_actions.device)
 
+    def test_log_sum_softmax_loss_ignores_invalid_optimal_actions(self):
+        logits = torch.tensor([[[0., 10., 2.]]])
+        valid_actions_mask = torch.tensor([[[True, False, True]]])
+        optimal_actions_mask = torch.tensor([[[False, True, True]]])
+
+        loss = self.transducer.log_sum_softmax_loss(
+            logits, optimal_actions_mask, valid_actions_mask)
+
+        expected = torch.tensor([[2.]]) - torch.logsumexp(
+            torch.tensor([[0., 2.]]), dim=1)
+        self.assertTrue(torch.allclose(expected, loss))
+
     def test_encoded_action_history_trims_at_end_word(self):
         encoded_history = torch.tensor([[
             [vocabulary.BEGIN_WORD, 10, vocabulary.END_WORD, 11],
