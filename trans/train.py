@@ -566,6 +566,9 @@ def cli_main():
                         help="Scheduler used in training.")
     parser.add_argument("--sed-em-iterations", type=int, default=10,
                         help="SED EM iterations.")
+    # Project default: keep damped EM for existing training behavior. This is a
+    # stabilized variant, not the paper-pure Ristad-Yianilos estimator; use
+    # --sed-em-mode strict for the paper-faithful update.
     parser.add_argument("--sed-em-mode", choices=["strict", "damped"],
                         default="damped",
                         help="SED EM estimator. strict is paper-faithful; damped interpolates with previous parameters.")

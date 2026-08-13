@@ -116,6 +116,10 @@ class StochasticEditDistance(actions.Aligner):
                       copy_probability: float = None,
                       em_iterations: int = 30,
                       output_path: str = None,
+                      # Project default: keep damped EM for existing training
+                      # behavior. This is a stabilized variant, not the
+                      # paper-pure Ristad-Yianilos estimator; use "strict" for
+                      # the paper-faithful update.
                       em_mode: str = "damped",
                       em_damping: float = 0.9):
 
@@ -130,6 +134,8 @@ class StochasticEditDistance(actions.Aligner):
             target_alphabet.update(target)
             sources.append(source)
             targets.append(target)
+        if not sources:
+            raise ValueError("Cannot fit SED from an empty corpus.")
 
         sed = cls.build_sed(source_alphabet, target_alphabet, copy_probability)
         sed.update_model(sources, targets, iterations=em_iterations,
