@@ -184,6 +184,17 @@ class TestTransducer(unittest.TestCase):
         after_ll = sed_.log_likelihood(sources, targets)
         self.assertTrue(before_ll <= after_ll)
 
+    def test_strict_em_does_not_decrease_likelihood(self):
+        input_pairs = [("ab", "ac"), ("ba", "ca"), ("a", "a")]
+        sources, targets = zip(*input_pairs)
+        sed_ = sed.StochasticEditDistance.build_sed("ab", "ac", copy_probability=None)
+
+        before_ll = sed_.log_likelihood(sources, targets)
+        sed_.em(sources, targets, iterations=1, mode="strict")
+        after_ll = sed_.log_likelihood(sources, targets)
+
+        self.assertGreaterEqual(after_ll + 1e-10, before_ll)
+
     def test_strict_m_step_uses_normalized_expected_counts(self):
         params = sed.ParamDict(
             delta_sub={("a", "b"): np.log(0.25)},
@@ -233,6 +244,56 @@ class TestTransducer(unittest.TestCase):
         ))
         self.assertTrue(np.isclose(0., sed_.params.sum()))
 
+    def test_damping_one_matches_strict_em(self):
+        input_pairs = [("a", "b"), ("aa", "bb")]
+        sources, targets = zip(*input_pairs)
+        params = sed.ParamDict(
+            delta_sub={("a", "b"): np.log(0.25)},
+            delta_del={"a": np.log(0.25)},
+            delta_ins={"b": np.log(0.25)},
+            delta_eos=np.log(0.25),
+        )
+        strict_sed = sed.StochasticEditDistance(sed.ParamDict.from_params(params))
+        damped_sed = sed.StochasticEditDistance(sed.ParamDict.from_params(params))
+
+        strict_sed.em(sources, targets, iterations=1, mode="strict")
+        damped_sed.em(sources, targets, iterations=1,
+                      mode="damped", damping=1.)
+
+        self.assert_params_close(strict_sed.params, damped_sed.params)
+
+    def test_interpolate_log_probabilities_matches_analytical_result(self):
+        interpolated = sed.StochasticEditDistance.interpolate_log_probabilities(
+            np.log(0.2), np.log(0.6), damping=0.75)
+
+        self.assertTrue(np.isclose(np.log(0.5), interpolated))
+
+    def test_zero_em_probability_survives_damping(self):
+        interpolated = sed.StochasticEditDistance.interpolate_log_probabilities(
+            old_value=np.log(0.4), em_value=sed.LOG_ZERO, damping=0.9)
+
+        self.assertTrue(np.isclose(np.log(0.04), interpolated))
+
+    def test_damped_parameters_are_normalized(self):
+        old_params = sed.ParamDict(
+            delta_sub={("a", "b"): np.log(0.20)},
+            delta_del={"a": np.log(0.30)},
+            delta_ins={"b": np.log(0.10)},
+            delta_eos=np.log(0.40),
+        )
+        em_params = sed.ParamDict(
+            delta_sub={("a", "b"): np.log(0.50)},
+            delta_del={"a": np.log(0.20)},
+            delta_ins={"b": np.log(0.20)},
+            delta_eos=np.log(0.10),
+        )
+
+        for damping in (0.1, 0.5, 0.9):
+            with self.subTest(damping=damping):
+                damped = sed.StochasticEditDistance.damp_parameters(
+                    old_params, em_params, damping)
+                self.assertTrue(np.isclose(0., damped.sum()))
+
     def test_m_step_rejects_zero_expected_count(self):
         params = sed.ParamDict(
             delta_sub={("a", "b"): np.log(0.25)},
@@ -257,6 +318,14 @@ class TestTransducer(unittest.TestCase):
         with self.assertRaises(ValueError):
             sed_.em(["a"], ["b"], iterations=1, damping=0.)
 
+    def test_em_rejects_empty_or_mismatched_corpus(self):
+        sed_ = sed.StochasticEditDistance.build_sed("a", "b", copy_probability=None)
+
+        with self.assertRaisesRegex(ValueError, "empty corpus"):
+            sed_.em([], [], iterations=1)
+        with self.assertRaisesRegex(ValueError, "same number"):
+            sed_.em(["a"], [], iterations=1)
+
     def test_fit_from_data(self):
 
         input_lines = [
@@ -267,6 +336,18 @@ class TestTransducer(unittest.TestCase):
         data = map(test_optimal_expert_substitutions.to_sample, input_lines)
         sed_ = sed.StochasticEditDistance.fit_from_data(data, em_iterations=1)
         logging.info(sed_.params)
+
+    def assert_params_close(self, left: sed.ParamDict, right: sed.ParamDict):
+        self.assertEqual(left.delta_sub.keys(), right.delta_sub.keys())
+        self.assertEqual(left.delta_del.keys(), right.delta_del.keys())
+        self.assertEqual(left.delta_ins.keys(), right.delta_ins.keys())
+        for key in left.delta_sub:
+            self.assertTrue(np.isclose(left.delta_sub[key], right.delta_sub[key]))
+        for key in left.delta_del:
+            self.assertTrue(np.isclose(left.delta_del[key], right.delta_del[key]))
+        for key in left.delta_ins:
+            self.assertTrue(np.isclose(left.delta_ins[key], right.delta_ins[key]))
+        self.assertTrue(np.isclose(left.delta_eos, right.delta_eos))
 
 
 if __name__ == "__main__":
