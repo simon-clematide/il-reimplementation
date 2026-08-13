@@ -88,6 +88,29 @@ def write_checkpoint_metadata(path: str, args: argparse.Namespace,
         json.dump(metadata, w, indent=2, sort_keys=True)
 
 
+def write_sed_metadata(path: str, args: argparse.Namespace,
+                       training_data: utils.Dataset,
+                       vocabulary_: vocabulary.Vocabularies) -> None:
+    metadata = {
+        "sed_params": os.path.basename(path).removesuffix(".json"),
+        "git_commit": current_git_commit(),
+        "args": vars(args),
+        "train": args.train,
+        "source_separator": vocabulary_.source_separator,
+        "target_separator": vocabulary_.target_separator,
+        "em_iterations": args.sed_em_iterations,
+        "em_mode": args.sed_em_mode,
+        "em_damping": args.sed_em_damping,
+        "num_samples": len(training_data.samples),
+        "source_alphabet_size": len(vocabulary_.characters.to_i2w()),
+        "target_alphabet_size": len(vocabulary_.target_characters),
+        "source_alphabet": vocabulary_.characters.to_i2w(),
+        "target_alphabet": sorted(vocabulary_.target_characters),
+    }
+    with open(path, "w") as w:
+        json.dump(metadata, w, indent=2, sort_keys=True)
+
+
 def decode(transducer_: transducer.Transducer, data_loader: torch.utils.data.DataLoader,
            beam_width: int = 1) -> utils.DecodingOutput:
     if beam_width == 1:
@@ -119,12 +142,17 @@ def decode(transducer_: transducer.Transducer, data_loader: torch.utils.data.Dat
         inputs, features, targets = \
             batch.input, batch.features, batch.target
         for i, p in enumerate(output.output):
+            input_text = transducer_.source_tokenizer.untokenize(inputs[i])
+            target_text = (
+                transducer_.target_tokenizer.untokenize(targets[i])
+                if targets[i] is not None else None
+            )
             if any(features):
-                prediction = f"{inputs[i]}\t{p}\t{features[i]}"
+                prediction = f"{input_text}\t{p}\t{features[i]}"
             else:
-                prediction = f"{inputs[i]}\t{p}"
+                prediction = f"{input_text}\t{p}"
             predictions.append(prediction)
-            if p == targets[i]:
+            if target_text is not None and p == target_text:
                 correct += 1
         loss += output.log_p
         if j > 0 and j % 100 == 0:
@@ -192,10 +220,13 @@ def precompute_from_expert(s: utils.Sample, transducer_: transducer.Transducer, 
 
 
 def main(args: argparse.Namespace):
+    args.source_separator = utils.Tokenizer.from_cli(args.source_separator).separator
+    args.target_separator = utils.Tokenizer.from_cli(args.target_separator).separator
+
     for key, value in vars(args).items():
         logging.info("%s: %s", str(key).ljust(15), value)
 
-    os.makedirs(args.output)
+    os.makedirs(args.output, exist_ok=True)
 
     if args.pytorch_seed is not None:
         torch.manual_seed(args.pytorch_seed)
@@ -216,6 +247,10 @@ def main(args: argparse.Namespace):
         logging.info("Will perform training on unnormalized data.")
 
     has_features = (args.feat_dim is not None)
+    source_tokenizer = utils.Tokenizer.from_cli(args.source_separator)
+    target_tokenizer = utils.Tokenizer.from_cli(args.target_separator)
+    args.source_separator = source_tokenizer.separator
+    args.target_separator = target_tokenizer.separator
     if has_features:
         vocabulary_class = vocabulary.FeatureVocabularies
     else:
@@ -223,6 +258,10 @@ def main(args: argparse.Namespace):
 
     if args.vocabulary is not None:
         vocabulary_ = vocabulary_class.from_pickle(args.vocabulary)
+        args.source_separator = vocabulary_.source_separator
+        args.target_separator = vocabulary_.target_separator
+        source_tokenizer = utils.Tokenizer(args.source_separator)
+        target_tokenizer = utils.Tokenizer(args.target_separator)
         logging.info("%d actions: %s", len(vocabulary_.actions),
                      vocabulary_.actions)
         logging.info("%d chars: %s", len(vocabulary_.characters),
@@ -231,7 +270,10 @@ def main(args: argparse.Namespace):
             logging.info("%d features: %s", len(vocabulary_.features),
                          vocabulary_.features)
     else:
-        vocabulary_ = vocabulary_class()
+        vocabulary_ = vocabulary_class(
+            source_separator=source_tokenizer.separator,
+            target_separator=target_tokenizer.separator,
+        )
 
     if args.precomputed_train is not None:
         training_data = utils.Dataset.from_pickle(args.precomputed_train, device=args.device)
@@ -241,15 +283,17 @@ def main(args: argparse.Namespace):
         with utils.OpenNormalize(args.train, args.nfd) as f:
             for line in f:
                 if has_features:
-                    input_, target, features = line.rstrip().split("\t", 2)
+                    input_text, target_text, features = line.rstrip().split("\t", 2)
                     encoded_features = torch.tensor(
                         vocabulary_.encode_features(features),
                         device=args.device,
                     )
                 else:
-                    input_, target = line.rstrip().split("\t", 1)
+                    input_text, target_text = line.rstrip().split("\t", 1)
                     features = encoded_features = None
 
+                input_ = source_tokenizer.tokenize(input_text)
+                target = target_tokenizer.tokenize(target_text)
                 encoded_input = torch.tensor(vocabulary_.encode_input(input_),
                                              device=args.device)
                 vocabulary_.encode_actions(target)
@@ -277,15 +321,17 @@ def main(args: argparse.Namespace):
     with utils.OpenNormalize(args.dev, args.nfd) as f:
         for line in f:
             if has_features:
-                input_, target, features = line.rstrip().split("\t", 2)
+                input_text, target_text, features = line.rstrip().split("\t", 2)
                 encoded_features = torch.tensor(
                     vocabulary_.encode_unseen_features(features),
                     device=args.device,
                 )
             else:
-                input_, target = line.rstrip().split("\t", 1)
+                input_text, target_text = line.rstrip().split("\t", 1)
                 features = encoded_features = None
 
+            input_ = source_tokenizer.tokenize(input_text)
+            target = target_tokenizer.tokenize(target_text)
             encoded_input = torch.tensor(vocabulary_.encode_unseen_input(input_),
                                          device=args.device)
             sample = utils.Sample(
@@ -302,18 +348,19 @@ def main(args: argparse.Namespace):
         with utils.OpenNormalize(args.test, args.nfd) as f:
             for line in f:
                 if has_features:
-                    input_, optional_target, features = line.rstrip().split(
+                    input_text, optional_target, features = line.rstrip().split(
                         "\t", 2)
                     encoded_features = torch.tensor(
                         vocabulary_.encode_unseen_features(features),
                         device=args.device,
                     )
-                    target = optional_target if optional_target else None
+                    target = target_tokenizer.tokenize(optional_target) if optional_target else None
                 else:
-                    input_, *optional_target = line.rstrip().split("\t", 1)
+                    input_text, *optional_target = line.rstrip().split("\t", 1)
                     features = encoded_features = None
-                    target = optional_target[0] if optional_target else None
+                    target = target_tokenizer.tokenize(optional_target[0]) if optional_target else None
 
+                input_ = source_tokenizer.tokenize(input_text)
                 encoded_input = torch.tensor(vocabulary_.encode_unseen_input(input_),
                                              device=args.device)
                 sample = utils.Sample(
@@ -334,6 +381,14 @@ def main(args: argparse.Namespace):
             training_data.samples, em_iterations=args.sed_em_iterations,
             output_path=sed_parameters_path, em_mode=args.sed_em_mode,
             em_damping=args.sed_em_damping)
+        sed_metadata_path = f"{sed_parameters_path}.json"
+        write_sed_metadata(
+            sed_metadata_path,
+            args,
+            training_data,
+            vocabulary_,
+        )
+        logging.info("Wrote SED metadata to %s.", sed_metadata_path)
     expert = optimal_expert_substitutions.OptimalSubstitutionExpert(sed_aligner)
 
     transducer_ = transducer.Transducer(vocabulary_, expert, args)
@@ -548,6 +603,10 @@ def cli_main():
                         help="Output directory.")
     parser.add_argument("--nfd", action="store_true", default=False,
                         help="Train on NFD-normalized data. Write out in NFC.")
+    parser.add_argument("--source-separator", default=utils.Tokenizer.NONE_VALUE,
+                        help="Literal source-token separator. Use 'none' for character tokens.")
+    parser.add_argument("--target-separator", default=utils.Tokenizer.NONE_VALUE,
+                        help="Literal target-token separator. Use 'none' for character tokens.")
     parser.add_argument("--char-dim", type=int, default=100,
                         help="Character peak_embedding dimension.")
     parser.add_argument("--feat-dim", type=int, default=None,

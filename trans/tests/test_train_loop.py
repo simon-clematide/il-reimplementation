@@ -8,6 +8,8 @@ import unittest
 import torch
 
 from trans import train
+from trans import utils
+from trans import vocabulary
 
 
 class CountingSGD(torch.optim.SGD):
@@ -143,6 +145,46 @@ class TestGradientAccumulation(unittest.TestCase):
         self.assertEqual(0.25, metadata["train_accuracy"])
         self.assertEqual({"device": "cpu", "epochs": 1}, metadata["args"])
         self.assertIn("git_commit", metadata)
+
+    def test_write_sed_metadata(self):
+        args = argparse.Namespace(
+            train="train.tsv",
+            source_separator=None,
+            target_separator=" ",
+            sed_em_iterations=3,
+            sed_em_mode="damped",
+            sed_em_damping=0.9,
+        )
+        vocabularies = vocabulary.Vocabularies(
+            characters=["a", "b"],
+            source_separator=None,
+            target_separator=" ",
+        )
+        vocabularies.encode_actions(["a", "d͡ʒ"])
+        dataset = utils.Dataset([
+            utils.Sample(["a"], ["a"]),
+            utils.Sample(["b"], ["d͡ʒ"]),
+        ])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            metadata_path = os.path.join(tmpdir, "sed.pkl.json")
+
+            train.write_sed_metadata(
+                metadata_path,
+                args,
+                dataset,
+                vocabularies,
+            )
+
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+
+        self.assertEqual("sed.pkl", metadata["sed_params"])
+        self.assertEqual("train.tsv", metadata["train"])
+        self.assertIsNone(metadata["source_separator"])
+        self.assertEqual(" ", metadata["target_separator"])
+        self.assertEqual(3, metadata["em_iterations"])
+        self.assertEqual(2, metadata["num_samples"])
+        self.assertIn("d͡ʒ", metadata["target_alphabet"])
 
     def test_should_stop_for_patience(self):
         self.assertFalse(train.should_stop_for_patience(0, 2))

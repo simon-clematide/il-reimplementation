@@ -1,4 +1,6 @@
 """Unit tests for vocabulary.py."""
+import os
+import tempfile
 import unittest
 
 from trans import vocabulary
@@ -76,6 +78,13 @@ class VocabularyTests(unittest.TestCase):
                         ConditionalIns("a")]
         self.assertListEqual(expected_i2w, vocabulary1.actions.i2w)
 
+    def test_vocabularies_encode_phone_actions(self):
+        vocabulary1 = vocabulary.Vocabularies(target_separator=" ")
+        vocabulary1.encode_actions(["a", "d͡ʒ", "e"])
+
+        self.assertIn(ConditionalSub("d͡ʒ"), vocabulary1.actions.i2w)
+        self.assertNotIn(ConditionalSub("͡"), vocabulary1.actions.i2w)
+
     def test_vocabularies_encode_unseen_input(self):
         encoded_fox = self.vocabularies.encode_unseen_input("fox")
         self.assertListEqual([0, 4, 5, 3, 1], encoded_fox)
@@ -99,6 +108,20 @@ class VocabularyTests(unittest.TestCase):
         expected_input = self.vocabularies.decode_input([5, 5, 4])
         self.assertEqual("oof", expected_input)
         self.assertRaises(IndexError, self.vocabularies.decode_input, [6])
+
+    def test_vocabularies_persist_separators(self):
+        vocabularies = vocabulary.Vocabularies(
+            source_separator=None,
+            target_separator=" ",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "vocabulary.pkl")
+            vocabularies.persist(path)
+
+            loaded = vocabulary.Vocabularies.from_pickle(path)
+
+        self.assertIsNone(loaded.source_separator)
+        self.assertEqual(" ", loaded.target_separator)
 
 
 if __name__ == "__main__":

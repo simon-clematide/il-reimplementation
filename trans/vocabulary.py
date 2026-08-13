@@ -75,10 +75,14 @@ class Vocabularies:
     """Holds encodings of input characters and edit actions."""
 
     def __init__(self, characters: Optional[Iterable[str]] = None,
-                 actions: Optional[Iterable[Any]] = None):
+                 actions: Optional[Iterable[Any]] = None,
+                 source_separator: Optional[str] = None,
+                 target_separator: Optional[str] = None):
         self.characters = Vocabulary(characters)
         self.actions = ActionVocabulary(actions)
         self.target_characters = set()
+        self.source_separator = source_separator
+        self.target_separator = target_separator
 
     def encode_input(self, input_: str) -> List[int]:
         encoded_input = [BEGIN_WORD]
@@ -112,7 +116,9 @@ class Vocabularies:
 
     def persist(self, filename: str):
         vocabularies = {"characters": self.characters.to_i2w(),
-                        "actions": self.actions.to_i2w()}
+                        "actions": self.actions.to_i2w(),
+                        "source_separator": self.source_separator,
+                        "target_separator": self.target_separator}
         with open(filename, mode="wb") as w:
             pickle.dump(vocabularies, w)
 
@@ -168,6 +174,8 @@ class FeatureVocabularies(Vocabularies):
     def persist(self, filename: str):
         vocabularies = {"characters": self.characters.to_i2w(),
                         "actions": self.actions.to_i2w(),
-                        "features": self.features.to_i2w()}
+                        "features": self.features.to_i2w(),
+                        "source_separator": self.source_separator,
+                        "target_separator": self.target_separator}
         with open(filename, mode="wb") as w:
             pickle.dump(vocabularies, w)

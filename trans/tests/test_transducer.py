@@ -9,6 +9,7 @@ import torch
 
 from trans import optimal_expert
 from trans import transducer
+from trans import utils
 from trans import vocabulary
 from trans.actions import Copy, ConditionalCopy, ConditionalDel, \
     ConditionalIns, ConditionalSub, Sub
@@ -118,6 +119,19 @@ class TransducerTests(unittest.TestCase):
         valid_actions = self.transducer.valid_actions_for_suffixes(suffix_lengths)
 
         self.assertEqual(torch.device("cpu"), valid_actions.device)
+
+    def test_decode_encoded_output_uses_target_separator(self):
+        transducer_ = self.build_small_transducer()
+        transducer_.target_tokenizer = utils.Tokenizer(" ")
+        transducer_.vocab.encode_actions(["d͡ʒ"])
+        phone_id = transducer_.vocab.encode_unseen_action(ConditionalIns("d͡ʒ"))
+
+        decoded_output = transducer_.decode_encoded_output(
+            [["a"]],
+            [[phone_id, vocabulary.COPY]],
+        )
+
+        self.assertEqual(["d͡ʒ a"], decoded_output)
 
     def test_log_sum_softmax_loss_ignores_invalid_optimal_actions(self):
         logits = torch.tensor([[[0., 10., 2.]]])

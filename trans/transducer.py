@@ -9,6 +9,7 @@ import torch
 import numpy as np
 
 from trans import optimal_expert
+from trans import utils
 from trans import vocabulary
 from trans.actions import ConditionalCopy, ConditionalDel, ConditionalIns, \
     ConditionalSub, Edit, EndOfSequence, GenerativeEdit, BeginOfSequence
@@ -73,6 +74,10 @@ class Transducer(torch.nn.Module):
 
         self.vocab = vocab
         self.optimal_expert = expert
+        self.source_tokenizer = utils.Tokenizer.from_cli(
+            getattr(args, "source_separator", getattr(vocab, "source_separator", None)))
+        self.target_tokenizer = utils.Tokenizer.from_cli(
+            getattr(args, "target_separator", getattr(vocab, "target_separator", None)))
 
         self.number_characters = len(vocab.characters)
         self.number_actions = len(vocab.actions)
@@ -578,12 +583,13 @@ class Transducer(torch.nn.Module):
             A list of the decoded strings."""
         output = []
         for i, seq in enumerate(encoded_output):
-            decoded_seq = ""
+            decoded_seq = []
             alignment = 0
             for a in seq:
                 char_, alignment, _ = self.decode_single_action(input_[i], a, alignment)
-                decoded_seq += char_
-            output.append("".join(decoded_seq))
+                if char_ != "":
+                    decoded_seq.append(char_)
+            output.append(self.target_tokenizer.untokenize(decoded_seq))
 
         return output
 
@@ -709,7 +715,7 @@ class Transducer(torch.nn.Module):
                     # 1. COMPLETE HYPOTHESIS, REDUCE BEAM
                     complete_hypothesis = Output(
                         action_history=action_history.squeeze(dim=1).cpu().tolist()[1:],
-                        output="".join(output),
+                        output=self.target_tokenizer.untokenize(output),
                         log_p=-expansion.negative_log_p.item())  # undo min heap minus
 
                     complete_hypotheses.append(complete_hypothesis)
@@ -739,7 +745,7 @@ class Transducer(torch.nn.Module):
 
                 complete_hypothesis = Output(
                     action_history=hypothesis.action_history.squeeze(dim=1).cpu().tolist()[1:],
-                    output="".join(hypothesis.output),
+                    output=self.target_tokenizer.untokenize(hypothesis.output),
                     log_p=-hypothesis.negative_log_p.item())  # undo min heap minus
 
                 complete_hypotheses.append(complete_hypothesis)

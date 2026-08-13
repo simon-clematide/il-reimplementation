@@ -66,6 +66,24 @@ class UtilsTests(unittest.TestCase):
             self.assertEqual(8, len(written_text))
             self.assertEqual(normalized_text, written_text)
 
+    def test_tokenizer_character_mode(self):
+        tokenizer = utils.Tokenizer.from_cli("none")
+
+        self.assertEqual(["a", "b"], tokenizer.tokenize("ab"))
+        self.assertEqual("ab", tokenizer.untokenize(["a", "b"]))
+
+    def test_tokenizer_separator_mode(self):
+        tokenizer = utils.Tokenizer(" ")
+
+        self.assertEqual(["a", "d͡ʒ", "e"], tokenizer.tokenize("a d͡ʒ e"))
+        self.assertEqual("a d͡ʒ e", tokenizer.untokenize(["a", "d͡ʒ", "e"]))
+
+    def test_tokenizer_rejects_empty_separator_tokens(self):
+        tokenizer = utils.Tokenizer(" ")
+
+        with self.assertRaisesRegex(ValueError, "Empty token"):
+            tokenizer.tokenize("a  b")
+
 
 if __name__ == "__main__":
     UtilsTests().run()

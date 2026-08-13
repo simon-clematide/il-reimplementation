@@ -64,6 +64,17 @@ The most important (and required) parameters are:
 
 For a full list of available training configurations, use ``trans-train --help``.
 
+By default, source and target strings are treated as character sequences. For
+phone-like outputs where symbols are separated by spaces, set a target
+separator:
+
+        --source-separator none --target-separator " "
+
+For example, the target field ``a d͡ʒ e n t͡s i a`` is then treated internally as
+the token sequence ``["a", "d͡ʒ", "e", "n", "t͡s", "i", "a"]`` rather than as
+individual Unicode characters and spaces. The separators are stored in
+``vocabulary.pkl`` and checkpoint metadata.
+
 For LSTM encoders, ``--enc-dropout`` is the legacy PyTorch inter-layer LSTM
 dropout. It only has an effect when ``--enc-layers`` is greater than 1. For
 explicit dropout on the encoder output sequence, including one-layer BiLSTMs,
@@ -77,6 +88,10 @@ an existing ``sed.pkl`` file. The default SED estimator is damped EM:
         --sed-em-mode damped --sed-em-damping 0.9
 
 Use ``--sed-em-mode strict`` for the paper-faithful Ristad-Yianilos EM update.
+When training fits a new SED model, it writes both ``sed.pkl`` and
+``sed.pkl.json``. The JSON sidecar records the training input path, token
+separators, EM settings, corpus size, alphabets, git commit, and full training
+arguments.
 
 ### Ensembling
 To ensemble a number of models based on majority voting, run the python script 
@@ -119,6 +134,28 @@ Example:
 
 The output is a TSV table with stochastic surprisal, normalized surprisal,
 Viterbi surprisal, alignment ambiguity, and the best Viterbi alignment.
+
+### Decoder Diagnostics
+To inspect incorrect greedy predictions against the SED-backed expert policy,
+use ``trans-diagnose`` after training:
+
+        trans-diagnose \
+          --model data.d/result/best.model \
+          --metadata data.d/result/best.model.json \
+          --vocabulary data.d/result/vocabulary.pkl \
+          --sed-params data.d/result/sed.pkl \
+          --input data.d/sigmorphon2021/low/ita_test.tsv \
+          --output data.d/result/diagnostics \
+          --device cpu
+
+The command writes two TSV files:
+
+* ``diagnostics.tsv``: one row per decoded example with summary statistics such
+  as ``first_non_optimal_step``, ``num_non_optimal``, ``fraction_oracle_optimal``,
+  and the oracle probability mass at the first policy deviation.
+* ``diagnostic_steps.tsv``: one row per decoded action with the model action,
+  model probability, expert-optimal action set, oracle-set probability mass,
+  oracle margin, and top model actions.
 
 #### Configuration file
 The JSON-based configuration file needs to be passed via ``--config`` parameter.

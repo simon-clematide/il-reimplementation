@@ -1,5 +1,5 @@
 """Utility functions and classes."""
-from typing import Any, Dict, List, Optional, TextIO, Union
+from typing import Any, Dict, Iterable, List, Optional, TextIO, Union
 import dataclasses
 import logging
 import os
@@ -9,6 +9,35 @@ import unicodedata
 import torch
 import pickle
 from trans.vocabulary import PAD
+
+
+class Tokenizer:
+    """Tokenize text as characters or by a literal separator."""
+
+    NONE_VALUE = "none"
+
+    def __init__(self, separator: Optional[str] = None):
+        self.separator = separator
+
+    @classmethod
+    def from_cli(cls, separator: Optional[str]) -> "Tokenizer":
+        if separator in (None, cls.NONE_VALUE):
+            return cls(None)
+        return cls(separator)
+
+    def tokenize(self, text: str) -> List[str]:
+        if self.separator is None:
+            return list(text)
+        tokens = text.split(self.separator)
+        if any(token == "" for token in tokens):
+            raise ValueError(
+                f"Empty token in {text!r} with separator {self.separator!r}.")
+        return tokens
+
+    def untokenize(self, tokens: Iterable[str]) -> str:
+        if self.separator is None:
+            return "".join(tokens)
+        return self.separator.join(tokens)
 
 
 @dataclasses.dataclass

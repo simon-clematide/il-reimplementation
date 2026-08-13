@@ -60,6 +60,8 @@ class TestBooleanArguments(unittest.TestCase):
 
         self.assertIn("--enc-hidden-dim", result.stdout)
         self.assertIn("(default: 200)", result.stdout)
+        self.assertIn("--source-separator", result.stdout)
+        self.assertIn("--target-separator", result.stdout)
         self.assertIn("--enc-output-dropout", result.stdout)
         self.assertIn("--enc-output-dropout-type", result.stdout)
         self.assertIn("--rho", result.stdout)
