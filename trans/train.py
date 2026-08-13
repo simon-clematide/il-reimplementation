@@ -66,6 +66,7 @@ def current_git_commit() -> str:
     try:
         return subprocess.check_output(
             ["git", "rev-parse", "HEAD"],
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             stderr=subprocess.DEVNULL,
             text=True,
         ).strip()
