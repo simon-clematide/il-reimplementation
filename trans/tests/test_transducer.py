@@ -41,6 +41,47 @@ class TransducerTests(unittest.TestCase):
         cls.transducer = transducer.Transducer(
             vocabulary_, expert, args)
 
+    @staticmethod
+    def build_small_transducer():
+        vocabulary_ = vocabulary.Vocabularies(characters=["a"])
+        vocabulary_.encode_actions("a")
+        expert = optimal_expert.OptimalExpert()
+
+        args = argparse.Namespace(
+            device='cpu',
+            char_dim=4,
+            action_dim=4,
+            enc_type='lstm',
+            enc_hidden_dim=4,
+            enc_layers=1,
+            enc_bidirectional=True,
+            enc_dropout=0.,
+            dec_hidden_dim=4,
+            dec_layers=1
+        )
+        return transducer.Transducer(vocabulary_, expert, args)
+
+    @staticmethod
+    def encoded_input(vocabularies, input_):
+        return torch.tensor(
+            [vocabularies.encode_unseen_input(input_)],
+            dtype=torch.long,
+        )
+
+    def assert_actions_are_valid_for_input(self, transducer_, input_, action_history):
+        alignment = 0
+        for action in action_history:
+            suffix_length = len(input_) + 1 - alignment
+            valid_actions = transducer_.compute_valid_actions(suffix_length)
+            self.assertTrue(
+                valid_actions[action],
+                f"Invalid action {action} at alignment {alignment} "
+                f"for input length {len(input_)}.",
+            )
+            alignment += transducer_.alignment_update[action].item()
+            if action == vocabulary.END_WORD:
+                break
+
     def test_sample(self):
         log_probs = log_softmax([5, 4, 10, 1])
         action_code = self.transducer.sample(log_probs)
@@ -86,6 +127,62 @@ class TransducerTests(unittest.TestCase):
         expected = torch.tensor([[2.]]) - torch.logsumexp(
             torch.tensor([[0., 2.]]), dim=1)
         self.assertTrue(torch.allclose(expected, loss))
+
+    def test_greedy_decode_accepts_boundary_input_lengths(self):
+        transducer_ = self.build_small_transducer()
+
+        for length in (0, 1, 99, 100, 250):
+            with self.subTest(length=length):
+                input_ = "a" * length
+                output = transducer_.transduce(
+                    [input_],
+                    self.encoded_input(transducer_.vocab, input_),
+                    encoded_features=None,
+                )
+                self.assertEqual(1, len(output.action_history))
+                self.assert_actions_are_valid_for_input(
+                    transducer_, input_, output.action_history[0])
+
+    def test_greedy_decode_accepts_mixed_length_batches(self):
+        transducer_ = self.build_small_transducer()
+        inputs = ["", "a", "a" * 100, "a" * 250]
+        encoded_inputs = [
+            torch.tensor(transducer_.vocab.encode_unseen_input(input_),
+                         dtype=torch.long)
+            for input_ in inputs
+        ]
+
+        output = transducer_.transduce(
+            inputs,
+            torch.nn.utils.rnn.pad_sequence(
+                encoded_inputs,
+                batch_first=True,
+                padding_value=vocabulary.PAD,
+            ),
+            encoded_features=None,
+        )
+
+        self.assertEqual(len(inputs), len(output.action_history))
+        for input_, action_history in zip(inputs, output.action_history):
+            self.assert_actions_are_valid_for_input(
+                transducer_, input_, action_history)
+
+    def test_beam_decode_accepts_boundary_input_lengths(self):
+        transducer_ = self.build_small_transducer()
+
+        for length in (0, 1, 99, 100, 250):
+            with self.subTest(length=length):
+                input_ = "a" * length
+                outputs = transducer_.beam_search_decode(
+                    input_,
+                    self.encoded_input(transducer_.vocab, input_),
+                    encoded_features=None,
+                    beam_width=2,
+                )
+                self.assertGreaterEqual(len(outputs), 1)
+                for output in outputs:
+                    self.assert_actions_are_valid_for_input(
+                        transducer_, input_, output.action_history)
 
     def test_encoded_action_history_trims_at_end_word(self):
         encoded_history = torch.tensor([[
