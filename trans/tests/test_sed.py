@@ -337,6 +337,10 @@ class TestTransducer(unittest.TestCase):
         sed_ = sed.StochasticEditDistance.fit_from_data(data, em_iterations=1)
         logging.info(sed_.params)
 
+    def test_fit_from_data_rejects_empty_corpus(self):
+        with self.assertRaisesRegex(ValueError, "empty corpus"):
+            sed.StochasticEditDistance.fit_from_data([], em_iterations=0)
+
     def assert_params_close(self, left: sed.ParamDict, right: sed.ParamDict):
         self.assertEqual(left.delta_sub.keys(), right.delta_sub.keys())
         self.assertEqual(left.delta_del.keys(), right.delta_del.keys())
