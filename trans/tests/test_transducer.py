@@ -45,7 +45,7 @@ class TransducerTests(unittest.TestCase):
             vocabulary_, expert, args)
 
     @staticmethod
-    def build_small_transducer():
+    def build_small_transducer(output_feedback_dim=0):
         vocabulary_ = vocabulary.Vocabularies(characters=["a"])
         vocabulary_.encode_actions("a")
         expert = optimal_expert.OptimalExpert()
@@ -61,6 +61,9 @@ class TransducerTests(unittest.TestCase):
             enc_dropout=0.,
             enc_output_dropout=0.,
             enc_output_dropout_type="locked",
+            output_feedback_dim=output_feedback_dim,
+            expert_temperature=0.,
+            expert_loss="marginal",
             dec_hidden_dim=4,
             dec_layers=1
         )
@@ -98,6 +101,11 @@ class TransducerTests(unittest.TestCase):
         valid_actions = self.transducer.compute_valid_actions(1)
         self.assertTrue(not valid_actions[vocabulary.COPY])
 
+    def test_compute_valid_actions_uses_requested_device(self):
+        valid_actions = self.transducer.compute_valid_actions(3, device="cpu")
+
+        self.assertEqual(torch.device("cpu"), valid_actions.device)
+
     def test_valid_actions_for_suffixes_matches_two_validity_states(self):
         suffix_lengths = torch.tensor([-3, -1, 0, 1, 2, 3, 20])
 
@@ -120,6 +128,32 @@ class TransducerTests(unittest.TestCase):
 
         self.assertEqual(torch.device("cpu"), valid_actions.device)
 
+    def test_encode_known_action_rejects_action_absent_from_vocabulary(self):
+        transducer_ = self.build_small_transducer()
+
+        with self.assertRaisesRegex(RuntimeError, "absent from action vocabulary"):
+            transducer_.encode_known_action(ConditionalIns("z"), "test")
+
+    def test_encode_expert_action_costs_uses_requested_device(self):
+        transducer_ = self.build_small_transducer()
+
+        costs = transducer_.encode_expert_action_costs(
+            {ConditionalCopy(): 0.},
+            device="cpu",
+        )
+
+        self.assertEqual(torch.device("cpu"), costs.device)
+
+    def test_validate_index_tensor_rejects_out_of_range_values(self):
+        transducer_ = self.build_small_transducer()
+
+        with self.assertRaisesRegex(RuntimeError, "test ids contains ids outside"):
+            transducer_.validate_index_tensor(
+                "test ids",
+                torch.tensor([0, transducer_.number_actions]),
+                transducer_.number_actions,
+            )
+
     def test_decode_encoded_output_uses_target_separator(self):
         transducer_ = self.build_small_transducer()
         transducer_.target_tokenizer = utils.Tokenizer(" ")
@@ -132,6 +166,428 @@ class TransducerTests(unittest.TestCase):
         )
 
         self.assertEqual(["d͡ʒ a"], decoded_output)
+
+    def test_output_symbol_for_action(self):
+        transducer_ = self.build_small_transducer()
+        transducer_.vocab.encode_actions(["x"])
+        source = ["a", "b"]
+
+        self.assertEqual("a", transducer_.output_symbol_for_action(source, vocabulary.COPY, 0))
+        self.assertEqual("b", transducer_.output_symbol_for_action(source, vocabulary.COPY, 1))
+        self.assertEqual("x", transducer_.output_symbol_for_action(source, ConditionalSub("x"), 1))
+        self.assertEqual("x", transducer_.output_symbol_for_action(source, ConditionalIns("x"), 0))
+        self.assertEqual(
+            vocabulary.NO_OUTPUT,
+            transducer_.output_symbol_for_action(source, vocabulary.DELETE, 0),
+        )
+        self.assertEqual(
+            vocabulary.BOS_OUTPUT,
+            transducer_.output_symbol_for_action(source, vocabulary.BEGIN_WORD, 0),
+        )
+
+    def test_output_feedback_disabled_has_legacy_decoder_input_dim(self):
+        transducer_ = self.build_small_transducer(output_feedback_dim=0)
+
+        self.assertIsNone(transducer_.output_lookup)
+        self.assertEqual(
+            transducer_.enc.output_size + 4,
+            transducer_.dec.input_size,
+        )
+
+    def test_output_feedback_extends_decoder_input_dim(self):
+        transducer_ = self.build_small_transducer(output_feedback_dim=3)
+
+        self.assertIsNotNone(transducer_.output_lookup)
+        self.assertEqual(
+            transducer_.enc.output_size + 4 + 3,
+            transducer_.dec.input_size,
+        )
+
+    def test_soft_oracle_loss_uses_cost_gaps(self):
+        transducer_ = self.build_small_transducer()
+        logits = torch.log(torch.tensor([[[0.6, 0.4, 0.0]]]))
+        valid_actions = torch.tensor([[[True, True, False]]])
+        expert_costs = torch.tensor([[[1.0, 1.2, float("inf")]]])
+
+        log_mass = transducer_.soft_oracle_loss(
+            logits,
+            expert_costs,
+            valid_actions,
+            temperature=0.2,
+        )
+
+        expected = np.log(0.6 + 0.4 * np.exp(-1.0))
+        self.assertTrue(torch.isclose(log_mass[0, 0], torch.tensor(expected, dtype=torch.float)))
+
+    def test_soft_oracle_loss_handles_padded_timesteps(self):
+        transducer_ = self.build_small_transducer()
+        logits = torch.randn(2, 1, transducer_.number_actions, requires_grad=True)
+        valid_actions = torch.zeros(2, 1, transducer_.number_actions, dtype=torch.bool)
+        valid_actions[0, 0, [vocabulary.END_WORD, vocabulary.COPY]] = True
+        expert_costs = torch.full((2, 1, transducer_.number_actions), float("inf"))
+        expert_costs[0, 0, vocabulary.END_WORD] = 0.
+        expert_costs[0, 0, vocabulary.COPY] = 1.
+
+        log_mass = transducer_.soft_oracle_loss(
+            logits,
+            expert_costs,
+            valid_actions,
+            temperature=4.,
+        )
+        loss = -log_mass.sum()
+        loss.backward()
+
+        self.assertTrue(torch.isfinite(log_mass).all())
+        self.assertTrue(torch.isfinite(logits.grad).all())
+        self.assertTrue(torch.equal(torch.zeros_like(logits.grad[1]), logits.grad[1]))
+
+    def test_focal_marginal_loss_gamma_zero_matches_marginal_loss_and_gradient(self):
+        transducer_ = self.build_small_transducer()
+        logits = torch.randn(
+            2,
+            1,
+            transducer_.number_actions,
+            requires_grad=True,
+        )
+        valid_actions = torch.zeros(2, 1, transducer_.number_actions, dtype=torch.bool)
+        valid_actions[0, 0, [vocabulary.END_WORD, vocabulary.COPY]] = True
+        valid_actions[1, 0, [vocabulary.END_WORD, vocabulary.DELETE]] = True
+        optimal_actions = torch.zeros(2, 1, transducer_.number_actions, dtype=torch.bool)
+        optimal_actions[0, 0, vocabulary.COPY] = True
+        optimal_actions[1, 0, vocabulary.END_WORD] = True
+
+        marginal = -transducer_.log_sum_softmax_loss(
+            logits,
+            optimal_actions,
+            valid_actions,
+        )
+        focal = transducer_.focal_marginal_loss(
+            logits,
+            optimal_actions,
+            valid_actions,
+            gamma=0.,
+        )
+        marginal.sum().backward(retain_graph=True)
+        marginal_grad = logits.grad.clone()
+        logits.grad.zero_()
+        focal.sum().backward()
+        focal_grad = logits.grad.clone()
+
+        self.assertTrue(torch.allclose(marginal, focal, atol=1e-6))
+        self.assertTrue(torch.allclose(marginal_grad, focal_grad, atol=1e-6))
+
+    def test_focal_marginal_loss_downweights_easy_states(self):
+        transducer_ = self.build_small_transducer()
+        logits = torch.log(torch.tensor([[[0.9, 0.1, 0.0]]]))
+        valid_actions = torch.tensor([[[True, True, False]]])
+        optimal_actions = torch.tensor([[[True, False, False]]])
+
+        focal = transducer_.focal_marginal_loss(
+            logits,
+            optimal_actions,
+            valid_actions,
+            gamma=2.,
+        )
+
+        expected = -((1. - 0.9) ** 2) * np.log(0.9)
+        self.assertTrue(torch.isclose(
+            focal[0, 0],
+            torch.tensor(expected, dtype=torch.float),
+        ))
+
+    def test_focal_marginal_loss_handles_padded_timesteps(self):
+        transducer_ = self.build_small_transducer()
+        logits = torch.randn(2, 1, transducer_.number_actions, requires_grad=True)
+        valid_actions = torch.zeros(2, 1, transducer_.number_actions, dtype=torch.bool)
+        valid_actions[0, 0, [vocabulary.END_WORD, vocabulary.COPY]] = True
+        optimal_actions = torch.zeros(2, 1, transducer_.number_actions, dtype=torch.bool)
+        optimal_actions[0, 0, vocabulary.END_WORD] = True
+
+        losses = transducer_.focal_marginal_loss(
+            logits,
+            optimal_actions,
+            valid_actions,
+            gamma=1.,
+        )
+        losses.sum().backward()
+
+        self.assertTrue(torch.isfinite(losses).all())
+        self.assertTrue(torch.isfinite(logits.grad).all())
+        self.assertTrue(torch.equal(torch.zeros_like(logits.grad[1]), logits.grad[1]))
+
+    def test_normalized_soft_expert_loss_matches_expected_cross_entropy(self):
+        transducer_ = self.build_small_transducer()
+        logits = torch.log(torch.tensor([[[0.6, 0.3, 0.1]]]))
+        valid_actions = torch.tensor([[[True, True, True]]])
+        expert_costs = torch.tensor([[[1.0, 1.2, float("inf")]]])
+
+        log_mass = transducer_.normalized_soft_expert_loss(
+            logits,
+            expert_costs,
+            valid_actions,
+            temperature=0.2,
+        )
+
+        expert_weights = torch.tensor([1.0, np.exp(-1.0)])
+        expert_probs = expert_weights / expert_weights.sum()
+        expected = (
+            expert_probs[0] * torch.log(torch.tensor(0.6)) +
+            expert_probs[1] * torch.log(torch.tensor(0.3))
+        ).float()
+        self.assertTrue(torch.isclose(log_mass[0, 0], expected))
+
+    def test_normalized_soft_expert_loss_handles_padded_timesteps(self):
+        transducer_ = self.build_small_transducer()
+        logits = torch.randn(2, 1, transducer_.number_actions, requires_grad=True)
+        valid_actions = torch.zeros(2, 1, transducer_.number_actions, dtype=torch.bool)
+        valid_actions[0, 0, [vocabulary.END_WORD, vocabulary.COPY]] = True
+        expert_costs = torch.full((2, 1, transducer_.number_actions), float("inf"))
+        expert_costs[0, 0, vocabulary.END_WORD] = 0.
+        expert_costs[0, 0, vocabulary.COPY] = 1.
+
+        log_mass = transducer_.normalized_soft_expert_loss(
+            logits,
+            expert_costs,
+            valid_actions,
+            temperature=4.,
+        )
+        loss = -log_mass.sum()
+        loss.backward()
+
+        self.assertTrue(torch.isfinite(log_mass).all())
+        self.assertTrue(torch.isfinite(logits.grad).all())
+        self.assertTrue(torch.equal(torch.zeros_like(logits.grad[1]), logits.grad[1]))
+
+    def test_margin_expert_loss_uses_best_oracle_and_best_decoder_valid_competitor(self):
+        transducer_ = self.build_small_transducer()
+        logits = torch.tensor([[[0.0, 2.0, 1.5, 4.0]]])
+        valid_actions = torch.tensor([[[True, True, True, True]]])
+        optimal_actions = torch.tensor([[[False, True, True, False]]])
+
+        losses = transducer_.margin_expert_loss(
+            logits,
+            optimal_actions,
+            valid_actions,
+            margin=1.0,
+        )
+
+        self.assertTrue(torch.equal(torch.tensor([[3.0]]), losses))
+        self.assertEqual(1, transducer_.last_margin_statistics["states"])
+        self.assertEqual(1, transducer_.last_margin_statistics["active"])
+        self.assertEqual(-2.0, transducer_.last_margin_statistics["margin_sum"])
+        self.assertEqual(3.0, transducer_.last_margin_statistics["active_loss_sum"])
+
+    def test_margin_expert_loss_is_zero_after_margin_is_satisfied(self):
+        transducer_ = self.build_small_transducer()
+        logits = torch.tensor([[[0.0, 5.0, 1.0]]])
+        valid_actions = torch.tensor([[[True, True, True]]])
+        optimal_actions = torch.tensor([[[False, True, False]]])
+
+        losses = transducer_.margin_expert_loss(
+            logits,
+            optimal_actions,
+            valid_actions,
+            margin=1.0,
+        )
+
+        self.assertTrue(torch.equal(torch.tensor([[0.0]]), losses))
+        self.assertEqual(0, transducer_.last_margin_statistics["active"])
+
+    def test_margin_expert_loss_handles_padded_timesteps(self):
+        transducer_ = self.build_small_transducer()
+        logits = torch.randn(2, 1, transducer_.number_actions, requires_grad=True)
+        valid_actions = torch.zeros(2, 1, transducer_.number_actions, dtype=torch.bool)
+        valid_actions[0, 0, [vocabulary.END_WORD, vocabulary.COPY]] = True
+        optimal_actions = torch.zeros(2, 1, transducer_.number_actions, dtype=torch.bool)
+        optimal_actions[0, 0, vocabulary.END_WORD] = True
+
+        losses = transducer_.margin_expert_loss(
+            logits,
+            optimal_actions,
+            valid_actions,
+            margin=1.0,
+        )
+        loss = losses.sum()
+        loss.backward()
+
+        self.assertTrue(torch.isfinite(losses).all())
+        self.assertTrue(torch.isfinite(logits.grad).all())
+        self.assertTrue(torch.equal(torch.zeros_like(logits.grad[1]), logits.grad[1]))
+
+    def test_decoder_step_clamps_alignment_lookup_indices(self):
+        transducer_ = self.build_small_transducer()
+        transducer_.h0_c0 = 1
+        encoder_output = torch.zeros(2, 1, transducer_.enc.output_size)
+        alignment = torch.tensor([-1, 0, 5])
+        action_history = torch.tensor([
+            [vocabulary.BEGIN_WORD],
+            [vocabulary.COPY],
+            [vocabulary.END_WORD],
+        ])
+
+        decoder_output, _ = transducer_.decoder_step(
+            encoder_output,
+            feature_embedding=None,
+            decoder_cell_state=transducer_.h0_c0,
+            alignment=alignment,
+            action_history=action_history,
+        )
+
+        self.assertEqual((3, 1, transducer_.dec_hidden_dim), tuple(decoder_output.shape))
+
+    def test_decoder_step_gathers_encoder_outputs_by_alignment(self):
+        transducer_ = self.build_small_transducer()
+        transducer_.h0_c0 = 2
+        seen_decoder_input = {}
+        encoder_output = torch.arange(
+            3 * 2 * transducer_.enc.output_size,
+            dtype=torch.float,
+        ).view(3, 2, transducer_.enc.output_size)
+        alignment = torch.tensor([0, 2, 1, 0])
+        action_history = torch.tensor([
+            [vocabulary.BEGIN_WORD, vocabulary.BEGIN_WORD],
+            [vocabulary.COPY, vocabulary.END_WORD],
+        ])
+
+        class Decoder(torch.nn.Module):
+            def forward(self, decoder_input, decoder_cell_state):
+                seen_decoder_input["value"] = decoder_input.detach()
+                return (
+                    torch.zeros(
+                        decoder_input.size(0),
+                        decoder_input.size(1),
+                        transducer_.dec_hidden_dim,
+                    ),
+                    decoder_cell_state,
+                )
+
+        transducer_.dec = Decoder()
+
+        transducer_.decoder_step(
+            encoder_output,
+            feature_embedding=None,
+            decoder_cell_state=transducer_.h0_c0,
+            alignment=alignment,
+            action_history=action_history,
+        )
+
+        expected_encoder_part = torch.stack([
+            encoder_output[0, 0],
+            encoder_output[1, 1],
+            encoder_output[2, 0],
+            encoder_output[0, 1],
+        ]).view(2, 2, -1)
+        actual_encoder_part = seen_decoder_input["value"][:, :, :transducer_.enc.output_size]
+        self.assertTrue(torch.equal(expected_encoder_part, actual_encoder_part))
+
+    def test_decoder_step_maps_negative_padded_history_ids_to_pad(self):
+        transducer_ = self.build_small_transducer(output_feedback_dim=2)
+        transducer_.h0_c0 = 1
+        encoder_output = torch.zeros(2, 1, transducer_.enc.output_size)
+        alignment = torch.tensor([0, 0, 0])
+        action_history = torch.tensor([
+            [vocabulary.BEGIN_WORD],
+            [-1],
+            [vocabulary.END_WORD],
+        ])
+        output_history = torch.tensor([
+            [transducer_.vocab.encode_output_symbol(vocabulary.BOS_OUTPUT)],
+            [-1],
+            [transducer_.vocab.encode_output_symbol(vocabulary.NO_OUTPUT)],
+        ])
+
+        decoder_output, _ = transducer_.decoder_step(
+            encoder_output,
+            feature_embedding=None,
+            decoder_cell_state=transducer_.h0_c0,
+            alignment=alignment,
+            action_history=action_history,
+            output_history=output_history,
+        )
+
+        self.assertEqual((3, 1, transducer_.dec_hidden_dim), tuple(decoder_output.shape))
+
+    def test_training_step_clears_stale_margin_statistics_for_non_margin_loss(self):
+        transducer_ = self.build_small_transducer()
+        transducer_.last_margin_statistics = {"states": 1}
+        encoded_input = self.encoded_input(transducer_.vocab, ["a"])
+        action_history = torch.tensor([[vocabulary.BEGIN_WORD]])
+        alignment_history = torch.tensor([0])
+        optimal_actions = torch.zeros(1, 1, transducer_.number_actions, dtype=torch.bool)
+        optimal_actions[0, 0, vocabulary.COPY] = True
+        valid_actions = torch.ones(1, 1, transducer_.number_actions, dtype=torch.bool)
+
+        def encoder_step(encoded_input, is_training=False):
+            return torch.zeros(1, 1, transducer_.enc.output_size)
+
+        def decoder_step(encoder_output, feature_embedding, decoder_cell_state,
+                         alignment, action_history, output_history=None):
+            return (
+                torch.zeros(1, 1, transducer_.dec_hidden_dim),
+                decoder_cell_state,
+            )
+
+        transducer_.encoder_step = encoder_step
+        transducer_.decoder_step = decoder_step
+
+        transducer_.training_step(
+            encoded_input=encoded_input,
+            encoded_features=None,
+            action_history=action_history,
+            output_history=None,
+            alignment_history=alignment_history,
+            expert_action_costs=None,
+            optimal_actions_mask=optimal_actions,
+            valid_actions_mask=valid_actions,
+        )
+
+        self.assertIsNone(transducer_.last_margin_statistics)
+
+    def test_transduce_passes_previous_output_feedback(self):
+        transducer_ = self.build_small_transducer(output_feedback_dim=2)
+        action_script = [vocabulary.COPY, vocabulary.END_WORD]
+        seen_output_history = []
+        step = {"i": 0}
+
+        def encoder_step(encoded_input, is_training=False):
+            return torch.zeros(
+                encoded_input.size(1) - 1,
+                encoded_input.size(0),
+                transducer_.enc.output_size,
+            )
+
+        def decoder_step(encoder_output, feature_embedding, decoder_cell_state,
+                         alignment, action_history, output_history=None):
+            seen_output_history.append(output_history.clone())
+            return (
+                torch.zeros(1, encoder_output.size(1), transducer_.dec_hidden_dim),
+                decoder_cell_state,
+            )
+
+        def calculate_actions(decoder_output, valid_actions_mask):
+            action = action_script[step["i"]]
+            step["i"] += 1
+            actions = torch.tensor([[action]], dtype=torch.long)
+            log_probs = torch.full((1, 1, transducer_.number_actions), -1000.0)
+            log_probs[0, 0, action] = -0.1
+            return actions, log_probs
+
+        transducer_.encoder_step = encoder_step
+        transducer_.decoder_step = decoder_step
+        transducer_.calculate_actions = calculate_actions
+
+        transducer_.transduce(
+            [["a"]],
+            self.encoded_input(transducer_.vocab, ["a"]),
+            encoded_features=None,
+        )
+
+        expected = [
+            transducer_.vocab.encode_output_symbol(vocabulary.BOS_OUTPUT),
+            transducer_.vocab.encode_output_symbol("a"),
+        ]
+        actual = [history.item() for history in seen_output_history]
+        self.assertEqual(expected, actual)
 
     def test_log_sum_softmax_loss_ignores_invalid_optimal_actions(self):
         logits = torch.tensor([[[0., 10., 2.]]])
@@ -201,6 +657,76 @@ class TransducerTests(unittest.TestCase):
                     self.assert_actions_are_valid_for_input(
                         transducer_, input_, output.action_history)
 
+    def test_beam_decode_keeps_live_beam_width_after_early_eos(self):
+        transducer_ = self.build_small_transducer()
+        decoder_calls = {"count": 0}
+
+        def encoder_step(encoded_input, is_training=False):
+            return torch.zeros(1, 1, transducer_.enc.output_size)
+
+        def decoder_step(encoder_output, feature_embedding, decoder_cell_state,
+                         alignment, action_history, output_history=None):
+            decoder_calls["count"] += 1
+            return (
+                torch.zeros(1, 1, transducer_.dec_hidden_dim),
+                decoder_cell_state,
+            )
+
+        def log_softmax_(logits, valid_actions_mask):
+            action_len = valid_actions_mask.size(2)
+            log_probs = torch.full((1, 1, action_len), -1000.0)
+            previous_action = int(current_action_history["value"][-1].item())
+            if previous_action == vocabulary.BEGIN_WORD:
+                log_probs[0, 0, vocabulary.END_WORD] = -0.1
+                log_probs[0, 0, vocabulary.COPY] = -0.2
+            elif previous_action == vocabulary.COPY:
+                log_probs[0, 0, vocabulary.END_WORD] = -0.1
+            return log_probs
+
+        current_action_history = {"value": None}
+
+        def decoder_step_with_history(encoder_output, feature_embedding,
+                                      decoder_cell_state, alignment,
+                                      action_history, output_history=None):
+            current_action_history["value"] = action_history
+            return decoder_step(
+                encoder_output,
+                feature_embedding,
+                decoder_cell_state,
+                alignment,
+                action_history,
+                output_history,
+            )
+
+        transducer_.encoder_step = encoder_step
+        transducer_.decoder_step = decoder_step_with_history
+        transducer_.log_softmax = log_softmax_
+
+        outputs = transducer_.beam_search_decode(
+            ["a"],
+            self.encoded_input(transducer_.vocab, ["a"]),
+            encoded_features=None,
+            beam_width=2,
+        )
+
+        self.assertEqual(2, len(outputs))
+        self.assertGreaterEqual(decoder_calls["count"], 2)
+        self.assertEqual([vocabulary.END_WORD], outputs[0].action_history)
+        self.assertEqual([vocabulary.COPY, vocabulary.END_WORD], outputs[1].action_history)
+
+    def test_beam_decode_logs_debug_stats(self):
+        transducer_ = self.build_small_transducer()
+
+        with self.assertLogs(level="DEBUG") as logs:
+            transducer_.beam_search_decode(
+                ["a"],
+                self.encoded_input(transducer_.vocab, ["a"]),
+                encoded_features=None,
+                beam_width=1,
+            )
+
+        self.assertIn("Beam stats: requested_width=1", "\n".join(logs.output))
+
     def test_transduce_finished_sequences_become_inert(self):
         transducer_ = self.build_small_transducer()
         action_script = [
@@ -224,7 +750,7 @@ class TransducerTests(unittest.TestCase):
             )
 
         def decoder_step(encoder_output, feature_embedding, decoder_cell_state,
-                         alignment, action_history):
+                         alignment, action_history, output_history=None):
             alignments.append(alignment.clone().cpu().tolist())
             return (
                 torch.zeros(1, encoder_output.size(1), transducer_.dec_hidden_dim),
@@ -286,7 +812,8 @@ class TransducerTests(unittest.TestCase):
                 )
 
             def decoder_step(encoder_output, feature_embedding,
-                             decoder_cell_state, alignment, action_history):
+                             decoder_cell_state, alignment, action_history,
+                             output_history=None):
                 return (
                     torch.zeros(1, encoder_output.size(1), transducer_.dec_hidden_dim),
                     decoder_cell_state,
@@ -356,7 +883,7 @@ class TransducerTests(unittest.TestCase):
             )
 
         def decoder_step(encoder_output, feature_embedding, decoder_cell_state,
-                         alignment, action_history):
+                         alignment, action_history, output_history=None):
             return (
                 torch.zeros(1, encoder_output.size(1), transducer_.dec_hidden_dim),
                 decoder_cell_state,
@@ -407,7 +934,7 @@ class TransducerTests(unittest.TestCase):
             )
 
         def decoder_step(encoder_output, feature_embedding, decoder_cell_state,
-                         alignment, action_history):
+                         alignment, action_history, output_history=None):
             return (
                 torch.zeros(1, encoder_output.size(1), transducer_.dec_hidden_dim),
                 decoder_cell_state,

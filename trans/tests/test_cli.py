@@ -62,6 +62,18 @@ class TestBooleanArguments(unittest.TestCase):
         self.assertIn("(default: 200)", result.stdout)
         self.assertIn("--source-separator", result.stdout)
         self.assertIn("--target-separator", result.stdout)
+        self.assertIn("--output-feedback-dim", result.stdout)
+        self.assertIn("--expert-temperature", result.stdout)
+        self.assertIn("--expert-loss", result.stdout)
+        self.assertIn("--focal-gamma", result.stdout)
+        self.assertIn("--focal-start", result.stdout)
+        self.assertIn("--focal-ramp", result.stdout)
+        self.assertIn("--expert-margin", result.stdout)
+        self.assertIn("--rollin-prob", result.stdout)
+        self.assertIn("--rollin-start", result.stdout)
+        self.assertIn("--rollin-refresh", result.stdout)
+        self.assertIn("--rollin-policy", result.stdout)
+        self.assertIn("--rollin-seed", result.stdout)
         self.assertIn("--enc-output-dropout", result.stdout)
         self.assertIn("--enc-output-dropout-type", result.stdout)
         self.assertIn("--rho", result.stdout)
@@ -88,6 +100,31 @@ class TestBooleanArguments(unittest.TestCase):
         self.assertIn("(default: 4)", result.stdout)
         self.assertIn("--betas", result.stdout)
         self.assertIn("(default: (0.9, 0.999))", result.stdout)
+
+    def test_focal_marginal_rejects_positive_expert_temperature(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "trans.train",
+                "--dev",
+                "dev.tsv",
+                "--output",
+                "out",
+                "--expert-loss",
+                "focal_marginal",
+                "--expert-temperature",
+                "1",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn(
+            "--expert-loss=focal_marginal requires --expert-temperature=0",
+            result.stderr,
+        )
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import dataclasses
 import functools
 import heapq
 import argparse
+import logging
 
 import torch
 import numpy as np
@@ -48,6 +49,7 @@ class Hypothesis:
     decoder: Tuple[torch.tensor, torch.tensor]
     negative_log_p: torch.tensor
     output: List[str]
+    previous_output: Optional[torch.tensor] = None
 
 
 @functools.total_ordering
@@ -74,6 +76,21 @@ class Transducer(torch.nn.Module):
 
         self.vocab = vocab
         self.optimal_expert = expert
+        self.expert_temperature = getattr(args, "expert_temperature", 0.)
+        if self.expert_temperature < 0:
+            raise ValueError("expert_temperature must be nonnegative.")
+        self.expert_loss = getattr(args, "expert_loss", "marginal")
+        if self.expert_loss not in {"marginal", "focal_marginal", "normalized_ce", "margin"}:
+            raise ValueError(
+                "expert_loss must be one of: marginal, focal_marginal, "
+                "normalized_ce, margin.")
+        self.focal_gamma = getattr(args, "focal_gamma", 1.0)
+        if self.focal_gamma < 0:
+            raise ValueError("focal_gamma must be nonnegative.")
+        self.expert_margin = getattr(args, "expert_margin", 1.0)
+        if self.expert_margin < 0:
+            raise ValueError("expert_margin must be nonnegative.")
+        self.last_margin_statistics = None
         self.source_tokenizer = utils.Tokenizer.from_cli(
             getattr(args, "source_separator", getattr(vocab, "source_separator", None)))
         self.target_tokenizer = utils.Tokenizer.from_cli(
@@ -101,6 +118,19 @@ class Transducer(torch.nn.Module):
         self.enc = ENCODER_MAPPING[args.enc_type](args)
 
         decoder_input_dim = self.enc.output_size + args.action_dim
+        self.output_feedback_dim = getattr(args, "output_feedback_dim", 0)
+        if self.output_feedback_dim < 0:
+            raise ValueError("output_feedback_dim must be nonnegative.")
+        if self.output_feedback_dim > 0:
+            self.output_lookup = torch.nn.Embedding(
+                num_embeddings=len(vocab.target_symbols),
+                embedding_dim=self.output_feedback_dim,
+                device=self.device,
+                padding_idx=PAD,
+            )
+            decoder_input_dim += self.output_feedback_dim
+        else:
+            self.output_lookup = None
 
         # feature encoder if required
         if isinstance(vocab, FeatureVocabularies):
@@ -222,7 +252,10 @@ class Transducer(torch.nn.Module):
 
         return emb.sum(dim=1).unsqueeze(dim=0)  # (1 x batch_size x feat_dim)
 
-    def compute_valid_actions(self, length_encoder_suffix: int) -> torch.tensor:
+    def compute_valid_actions(
+            self,
+            length_encoder_suffix: int,
+            device: Optional[Union[str, torch.device]] = None) -> torch.tensor:
         """Computes the valid actions for a given encoder suffix as a boolean mask.
 
         Args:
@@ -230,8 +263,10 @@ class Transducer(torch.nn.Module):
 
         Returns:
             The boolean mask for the given length."""
+        if device is None:
+            device = self.device
         valid_actions = torch.full((self.number_actions,), False,
-                                   dtype=torch.bool, device=self.device)
+                                   dtype=torch.bool, device=device)
         valid_actions[END_WORD] = True
         valid_actions[self.inserts] = True
         if length_encoder_suffix > 1:
@@ -283,6 +318,22 @@ class Transducer(torch.nn.Module):
             remapped_action_scores[remapped_action] = score
         return remapped_action_scores
 
+    def encode_known_action(self, action: Any, context: str) -> int:
+        try:
+            action_id = self.vocab.encode_unseen_action(action)
+        except KeyError as error:
+            raise RuntimeError(
+                f"{context}: expert action is absent from action vocabulary: "
+                f"action={action!r}."
+            ) from error
+        if action_id < 0 or action_id >= self.number_actions:
+            raise RuntimeError(
+                f"{context}: expert action id is outside action vocabulary: "
+                f"action={action!r}, encoded_action={action_id}, "
+                f"num_actions={self.number_actions}."
+            )
+        return action_id
+
     def expert_rollout(self, input_: str, target: str, alignment: int,
                        prediction: List[str]) -> List[int]:
         """Rolls out with optimal expert policy.
@@ -295,14 +346,38 @@ class Transducer(torch.nn.Module):
 
         Returns:
             List of optimal actions as integer codes."""
-        raw_action_scores = self.optimal_expert.score(
+        action_scores = self.expert_action_scores(
             input_, target, alignment, prediction)
-        action_scores = self.remap_actions(raw_action_scores)
 
         optimal_value = min(action_scores.values())
-        return [self.vocab.encode_unseen_action(action)
-                for action, value in action_scores.items()
-                if value == optimal_value]
+        return [
+            self.encode_known_action(action, "expert_rollout")
+            for action, value in action_scores.items()
+            if value == optimal_value
+        ]
+
+    def expert_action_scores(self, input_: str, target: str, alignment: int,
+                             prediction: List[str]) -> Dict[Any, float]:
+        raw_action_scores = self.optimal_expert.score(
+            input_, target, alignment, prediction)
+        return self.remap_actions(raw_action_scores)
+
+    def encode_expert_action_costs(
+            self,
+            action_scores: Dict[Any, float],
+            device: Optional[Union[str, torch.device]] = None) -> torch.tensor:
+        if device is None:
+            device = self.device
+        costs = torch.full(
+            (self.number_actions,),
+            float("inf"),
+            dtype=torch.float,
+            device=device,
+        )
+        for action, cost in action_scores.items():
+            action_id = self.encode_known_action(action, "encode_expert_action_costs")
+            costs[action_id] = cost
+        return costs
 
     def mark_as_invalid(self, logits: torch.tensor,
                         valid_actions_mask: torch.tensor) -> torch.tensor:
@@ -332,6 +407,18 @@ class Transducer(torch.nn.Module):
             The logits after marking non-valid actions as such and applying the log_softmax function."""
         logits_valid = self.mark_as_invalid(logits, valid_actions_mask)
         return torch.nn.functional.log_softmax(logits_valid, dim=2)
+
+    def validate_index_tensor(self, name: str, values: torch.tensor,
+                              upper_bound: int) -> None:
+        if values.numel() == 0:
+            return
+        if torch.any(values < 0).item() or torch.any(values >= upper_bound).item():
+            values_cpu = values.detach().cpu()
+            raise RuntimeError(
+                f"{name} contains ids outside [0, {upper_bound}): "
+                f"min={values_cpu.min().item()}, max={values_cpu.max().item()}, "
+                f"shape={tuple(values_cpu.shape)}."
+            )
 
     def log_sum_softmax_loss(self, logits: torch.tensor,
                              optimal_actions_mask: torch.tensor,
@@ -372,6 +459,155 @@ class Transducer(torch.nn.Module):
 
         return log_sum_selected_terms - normalization_term
 
+    def focal_marginal_loss(self, logits: torch.tensor,
+                            optimal_actions_mask: torch.tensor,
+                            valid_actions_mask: torch.tensor,
+                            gamma: float) -> torch.tensor:
+        """Focalized hard set-valued oracle loss.
+
+        For every non-padding state:
+            p* = sum_{a in A*(s)} p(a | s)
+            L = -(1 - p*)**gamma * log(p*)
+
+        gamma=0 exactly recovers ordinary marginal training.
+        """
+        if gamma < 0:
+            raise ValueError("gamma must be nonnegative.")
+        log_p_optimal = self.log_sum_softmax_loss(
+            logits,
+            optimal_actions_mask,
+            valid_actions_mask,
+        )
+        p_optimal = torch.exp(log_p_optimal)
+        focal_weight = (1.0 - p_optimal).clamp(min=0.0).pow(gamma)
+        losses = -focal_weight * log_p_optimal
+        paddings = ~torch.any(optimal_actions_mask, dim=2)
+        losses = torch.where(
+            ~paddings,
+            losses,
+            torch.zeros_like(losses),
+        )
+        if not torch.isfinite(losses[~paddings]).all():
+            raise FloatingPointError("Focal marginal loss produced non-finite values.")
+        return losses
+
+    def soft_oracle_loss(self, logits: torch.tensor,
+                         expert_action_costs: torch.tensor,
+                         valid_actions_mask: torch.tensor,
+                         temperature: float) -> torch.tensor:
+        """Cost-sensitive oracle log mass.
+
+        This computes log sum_a p(a) * exp(-(C(a)-C*) / temperature) over
+        mechanically valid actions. The hard oracle loss is the zero-temperature
+        limiting case and remains the default path.
+        """
+        if temperature <= 0:
+            raise ValueError("Soft oracle temperature must be positive.")
+        paddings = ~torch.any(valid_actions_mask, dim=2)
+        safe_valid_actions_mask = valid_actions_mask.clone()
+        safe_valid_actions_mask[paddings, 0] = True
+        log_probs = self.log_softmax(logits, safe_valid_actions_mask)
+        valid_costs = expert_action_costs.clone()
+        valid_costs[~safe_valid_actions_mask] = float("inf")
+        valid_costs[paddings, 0] = 0.
+        best_costs = torch.min(valid_costs, dim=2, keepdim=True).values
+        cost_gaps = valid_costs - best_costs
+        weighted_terms = log_probs - cost_gaps / temperature
+        weighted_terms[~safe_valid_actions_mask] = -float("inf")
+        log_weighted_mass = torch.logsumexp(weighted_terms, dim=2)
+        log_weighted_mass = torch.where(
+            ~paddings,
+            log_weighted_mass,
+            torch.tensor(0., device=self.device),
+        )
+        if not torch.isfinite(log_weighted_mass[~paddings]).all():
+            raise FloatingPointError("Soft oracle loss produced non-finite values.")
+        return log_weighted_mass
+
+    def normalized_soft_expert_loss(self, logits: torch.tensor,
+                                    expert_action_costs: torch.tensor,
+                                    valid_actions_mask: torch.tensor,
+                                    temperature: float) -> torch.tensor:
+        """Expected log-probability under a normalized soft expert distribution.
+
+        The expert distribution is defined over actions with finite expert costs.
+        Decoder-valid but expert-unscored actions remain in the model
+        normalization, but receive no expert target mass.
+        """
+        if temperature <= 0:
+            raise ValueError("Soft expert temperature must be positive.")
+        finite_expert_mask = torch.isfinite(expert_action_costs)
+        paddings = ~torch.any(finite_expert_mask, dim=2)
+        safe_valid_actions_mask = valid_actions_mask.clone()
+        safe_valid_actions_mask[paddings, 0] = True
+        log_probs = self.log_softmax(logits, safe_valid_actions_mask)
+
+        safe_costs = expert_action_costs.clone()
+        safe_costs[~finite_expert_mask] = float("inf")
+        safe_costs[paddings, 0] = 0.
+        best_costs = torch.min(safe_costs, dim=2, keepdim=True).values
+        cost_gaps = safe_costs - best_costs
+        expert_logits = -cost_gaps / temperature
+        expert_logits[~finite_expert_mask] = -float("inf")
+        expert_logits[paddings, 0] = 0.
+        expert_log_probs = torch.nn.functional.log_softmax(expert_logits, dim=2)
+        expert_probs = torch.exp(expert_log_probs).masked_fill(
+            ~finite_expert_mask,
+            0.,
+        )
+        safe_log_probs = log_probs.masked_fill(~finite_expert_mask, 0.)
+        expected_log_prob = torch.sum(expert_probs * safe_log_probs, dim=2)
+        expected_log_prob = torch.where(
+            ~paddings,
+            expected_log_prob,
+            torch.zeros_like(expected_log_prob),
+        )
+        if not torch.isfinite(expected_log_prob[~paddings]).all():
+            raise FloatingPointError("Normalized soft expert loss produced non-finite values.")
+        return expected_log_prob
+
+    def margin_expert_loss(self, logits: torch.tensor,
+                           optimal_actions_mask: torch.tensor,
+                           valid_actions_mask: torch.tensor,
+                           margin: float) -> torch.tensor:
+        """Fixed-margin hinge loss over expert-optimal vs decoder-valid actions."""
+        paddings = ~torch.any(optimal_actions_mask, dim=2)
+        oracle_mask = valid_actions_mask & optimal_actions_mask
+        nonoracle_mask = valid_actions_mask & ~oracle_mask
+        oracle_mask = oracle_mask.clone()
+        nonoracle_mask = nonoracle_mask.clone()
+        # MPS max backward cannot handle reductions where every action was
+        # masked to -inf: its internal argmax can become -1 and fail in a
+        # scatter kernel. Padding rows and rows without a competitor are
+        # semantically zero-loss, so give them one finite dummy action before
+        # reducing and mask them out after the hinge computation.
+        no_oracle = ~torch.any(oracle_mask, dim=2)
+        no_nonoracle = ~torch.any(nonoracle_mask, dim=2)
+        oracle_mask[no_oracle, 0] = True
+        nonoracle_mask[no_nonoracle, 0] = True
+
+        oracle_best = logits.masked_fill(~oracle_mask, -torch.inf).max(dim=2).values
+        nonoracle_best = logits.masked_fill(~nonoracle_mask, -torch.inf).max(dim=2).values
+        hinge = torch.relu(margin + nonoracle_best - oracle_best)
+        zero_loss = paddings | no_oracle | no_nonoracle
+        hinge = torch.where(~zero_loss, hinge, torch.zeros_like(hinge))
+        if not torch.isfinite(hinge[~paddings]).all():
+            raise FloatingPointError("Margin expert loss produced non-finite values.")
+
+        margins = oracle_best - nonoracle_best
+        valid_states = ~zero_loss
+        finite_margins = margins[valid_states & torch.isfinite(margins)]
+        active = hinge[valid_states] > 0
+        active_losses = hinge[valid_states][active]
+        self.last_margin_statistics = {
+            "states": int(valid_states.sum().item()),
+            "active": int(active.sum().item()),
+            "margin_sum": float(finite_margins.sum().item()) if finite_margins.numel() > 0 else 0.,
+            "margin_count": int(finite_margins.numel()),
+            "active_loss_sum": float(active_losses.sum().item()) if active_losses.numel() > 0 else 0.,
+        }
+        return hinge
+
     def encoder_step(self, encoded_input: torch.tensor, is_training: bool = False) -> torch.tensor:
         """Runs the encoder.
 
@@ -396,7 +632,8 @@ class Transducer(torch.nn.Module):
                      feature_embedding: Optional[torch.tensor],
                      decoder_cell_state: torch.tensor,
                      alignment: torch.tensor,
-                     action_history: torch.tensor) -> torch.tensor:
+                     action_history: torch.tensor,
+                     output_history: Optional[torch.tensor] = None) -> torch.tensor:
         """Runs the decoder.
 
         Args:
@@ -410,14 +647,47 @@ class Transducer(torch.nn.Module):
             Decoder output."""
         # build decoder input
         batch_size = encoder_output.size(1)
-        input_char_embedding = encoder_output \
-            [alignment, torch.tensor([i for i in range(batch_size) for _ in range(len(alignment) // batch_size)],
-                                     device=self.device)].unsqueeze(dim=0)
-        input_char_embedding = torch.reshape(input_char_embedding,
-                                             (batch_size, len(alignment) // batch_size, -1)).transpose(0, 1)
-        previous_action_embedding = self.act_lookup(action_history)
+        decoder_steps = len(alignment) // batch_size
+        safe_alignment = alignment.clamp(min=0, max=encoder_output.size(0) - 1)
+        self.validate_index_tensor(
+            "decoder alignment",
+            safe_alignment,
+            encoder_output.size(0),
+        )
+        alignment_by_batch = safe_alignment.view(batch_size, decoder_steps).transpose(0, 1)
+        gather_index = alignment_by_batch.unsqueeze(dim=2).expand(
+            -1,
+            -1,
+            encoder_output.size(2),
+        )
+        input_char_embedding = torch.gather(
+            encoder_output,
+            dim=0,
+            index=gather_index,
+        )
+        safe_action_history = action_history.masked_fill(action_history < 0, PAD)
+        self.validate_index_tensor(
+            "decoder action history",
+            safe_action_history,
+            self.number_actions,
+        )
+        previous_action_embedding = self.act_lookup(safe_action_history)
+        if self.device.type == "mps":
+            torch.mps.synchronize()
 
         decoder_inputs = [input_char_embedding, previous_action_embedding]
+        if self.output_lookup is not None:
+            if output_history is None:
+                raise ValueError("Output feedback requires output_history.")
+            safe_output_history = output_history.masked_fill(output_history < 0, PAD)
+            self.validate_index_tensor(
+                "decoder output history",
+                safe_output_history,
+                len(self.vocab.target_symbols),
+            )
+            decoder_inputs.append(self.output_lookup(safe_output_history))
+            if self.device.type == "mps":
+                torch.mps.synchronize()
         if self.has_features:
             # Repeats the feature embedding along the decoder steps dimension.
             number_of_decoder_steps = previous_action_embedding.shape[0]
@@ -453,7 +723,9 @@ class Transducer(torch.nn.Module):
     def training_step(self, encoded_input: torch.tensor,
                       encoded_features: Optional[torch.tensor],
                       action_history: torch.tensor,
+                      output_history: Optional[torch.tensor],
                       alignment_history: torch.tensor,
+                      expert_action_costs: Optional[torch.tensor],
                       optimal_actions_mask: torch.tensor,
                       valid_actions_mask: torch.tensor,
                       ) -> torch.tensor:
@@ -470,6 +742,7 @@ class Transducer(torch.nn.Module):
         Returns:
             The loss for sequences in the batch. The loss is calculated on sequence-level, i.e., for each sequence
             a single gradient is produced."""
+        self.last_margin_statistics = None
         batch_size = encoded_input.size()[0]
 
         # adjust initial decoder states if batch_size has changed
@@ -484,14 +757,50 @@ class Transducer(torch.nn.Module):
         # run decoder & classifier
         decoder_output, _ = self.decoder_step(
             bidirectional_emb, feature_emb, self.h0_c0,
-            alignment_history, action_history)
+            alignment_history, action_history, output_history)
         logits = self.W(decoder_output)
 
         # compute losses
         # the loss for each seq in the batch is divided by the nr of non-padding elements
         # --> loss per seq = avg. loss per token in seq
         true_action_lengths = action_history.size(0) - (action_history == PAD).sum(dim=0)
-        losses = self.log_sum_softmax_loss(logits, optimal_actions_mask, valid_actions_mask)
+        if self.expert_loss == "margin":
+            losses = self.margin_expert_loss(
+                logits,
+                optimal_actions_mask,
+                valid_actions_mask,
+                self.expert_margin,
+            )
+            losses = losses.sum(dim=0) / true_action_lengths
+            return losses
+        if self.expert_loss == "focal_marginal":
+            losses = self.focal_marginal_loss(
+                logits,
+                optimal_actions_mask,
+                valid_actions_mask,
+                self.focal_gamma,
+            )
+            losses = losses.sum(dim=0) / true_action_lengths
+            return losses
+        if self.expert_temperature > 0:
+            if expert_action_costs is None:
+                raise ValueError("Soft oracle loss requires expert_action_costs.")
+            if self.expert_loss == "normalized_ce":
+                losses = self.normalized_soft_expert_loss(
+                    logits,
+                    expert_action_costs,
+                    valid_actions_mask,
+                    self.expert_temperature,
+                )
+            else:
+                losses = self.soft_oracle_loss(
+                    logits,
+                    expert_action_costs,
+                    valid_actions_mask,
+                    self.expert_temperature,
+                )
+        else:
+            losses = self.log_sum_softmax_loss(logits, optimal_actions_mask, valid_actions_mask)
         losses = -losses.sum(dim=0) / true_action_lengths
 
         return losses
@@ -516,6 +825,9 @@ class Transducer(torch.nn.Module):
         alignment = torch.full((batch_size,), 0, device=self.device)
         action_history = torch.tensor([[[BEGIN_WORD]] * batch_size],
                                       device=self.device, dtype=torch.int)
+        previous_output = torch.tensor(
+            [[self.vocab.encode_output_symbol(vocabulary.BOS_OUTPUT)] * batch_size],
+            device=self.device, dtype=torch.long)
         log_p = torch.full((1, batch_size), 0.0, device=self.device)
         finished = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
         action_lengths = torch.zeros(batch_size, dtype=torch.long, device=self.device)
@@ -539,7 +851,8 @@ class Transducer(torch.nn.Module):
             # run decoder
             decoder_output, decoder = self.decoder_step(
                 bidirectional_emb, feature_emb, decoder,
-                alignment, action_history[:, :, -1])
+                alignment, action_history[:, :, -1],
+                previous_output if self.output_lookup is not None else None)
 
             # get actions
             actions, log_probs = self.calculate_actions(decoder_output, valid_actions_mask)
@@ -557,6 +870,16 @@ class Transducer(torch.nn.Module):
                 (action_history, actions.unsqueeze(dim=2)),
                 dim=2
             )
+            if self.output_lookup is not None:
+                next_output = torch.tensor([[
+                    self.output_symbol_id_for_action(
+                        input_[i],
+                        action_ids[i].item(),
+                        alignment[i],
+                    )
+                    for i in range(batch_size)
+                ]], device=self.device, dtype=torch.long)
+                previous_output = torch.where(active.unsqueeze(dim=0), next_output, previous_output)
             alignment = alignment + self.alignment_update[action_ids] * active
             finished = finished | (active & (action_ids == END_WORD))
 
@@ -592,6 +915,29 @@ class Transducer(torch.nn.Module):
             output.append(self.target_tokenizer.untokenize(decoded_seq))
 
         return output
+
+    def output_symbol_for_action(self, input_: Union[str, List[str]],
+                                 action: Union[int, Edit],
+                                 alignment: Union[int, torch.tensor]) -> Any:
+        if isinstance(action, int):
+            action = self.vocab.decode_action(action)
+        if torch.is_tensor(alignment):
+            alignment = alignment.item()
+        if isinstance(action, ConditionalCopy):
+            return input_[alignment]
+        if isinstance(action, (ConditionalIns, ConditionalSub)):
+            return action.new
+        if isinstance(action, BeginOfSequence):
+            return vocabulary.BOS_OUTPUT
+        if isinstance(action, (ConditionalDel, EndOfSequence)):
+            return vocabulary.NO_OUTPUT
+        raise ValueError(f"Unknown action: {action}.")
+
+    def output_symbol_id_for_action(self, input_: Union[str, List[str]],
+                                    action: Union[int, Edit],
+                                    alignment: Union[int, torch.tensor]) -> int:
+        return self.vocab.encode_output_symbol(
+            self.output_symbol_for_action(input_, action, alignment))
 
     def decode_single_action(self, input_: Union[str, List[str]], action: Union[int, Edit],
                              alignment: Union[int, torch.tensor]) -> Tuple[str, int, bool]:
@@ -663,16 +1009,30 @@ class Transducer(torch.nn.Module):
                        alignment=torch.tensor([0], device=self.device),
                        decoder=self.h0_c0,
                        negative_log_p=torch.tensor(0., device=self.device),
-                       output=[])]
+                       output=[],
+                       previous_output=torch.tensor(
+                           [[self.vocab.encode_output_symbol(vocabulary.BOS_OUTPUT)]],
+                           device=self.device, dtype=torch.long))]
 
+        search_beam_width = beam_width
+        num_outputs_needed = beam_width
         hypothesis_length = 0
         complete_hypotheses = []
+        n_decoder_calls = 0
+        n_expansions = 0
+        max_active_beam = 0
+        beam_sizes = []
 
-        while beam and beam_width > 0 and hypothesis_length <= MAX_ACTION_SEQ_LEN:
+        while beam and len(complete_hypotheses) < num_outputs_needed \
+                and hypothesis_length <= MAX_ACTION_SEQ_LEN:
+
+            beam_sizes.append(len(beam))
+            max_active_beam = max(max_active_beam, len(beam))
 
             expansions: List[Expansion] = []
 
             for hypothesis in beam:
+                n_decoder_calls += 1
 
                 length_encoder_suffix = max(input_length - hypothesis.alignment, torch.tensor([0], device=self.device))
                 valid_actions_mask = self.valid_actions_for_suffixes(length_encoder_suffix)
@@ -681,13 +1041,16 @@ class Transducer(torch.nn.Module):
                                                             feature_emb,
                                                             hypothesis.decoder,
                                                             hypothesis.alignment,
-                                                            hypothesis.action_history[-1].unsqueeze(dim=0))
+                                                            hypothesis.action_history[-1].unsqueeze(dim=0),
+                                                            hypothesis.previous_output
+                                                            if self.output_lookup is not None else None)
                 logits = self.W(decoder_output)
                 log_probs = self.log_softmax(logits, valid_actions_mask)
 
                 for action in torch.arange(0, valid_actions_mask.size(2), device=self.device):
                     if not valid_actions_mask[0, 0, action]:
                         continue
+                    n_expansions += 1
                     log_p = hypothesis.negative_log_p - \
                             log_probs[0, 0, action]  # min heap, so minus
 
@@ -697,7 +1060,7 @@ class Transducer(torch.nn.Module):
 
             beam: List[Hypothesis] = []
 
-            for _ in range(min(beam_width, len(expansions))):
+            for _ in range(min(search_beam_width, len(expansions))):
 
                 expansion: Expansion = heapq.heappop(expansions)
                 from_hypothesis = expansion.from_hypothesis
@@ -719,7 +1082,6 @@ class Transducer(torch.nn.Module):
                         log_p=-expansion.negative_log_p.item())  # undo min heap minus
 
                     complete_hypotheses.append(complete_hypothesis)
-                    beam_width -= 1
                 else:
                     # 2. EXECUTE ACTION AND ADD FULL HYPOTHESIS TO NEW BEAM
                     alignment = from_hypothesis.alignment.clone()
@@ -727,13 +1089,25 @@ class Transducer(torch.nn.Module):
                     char_, alignment, _ = self.decode_single_action(input_, action, alignment)
                     if char_ != "":
                         output.append(char_)
+                    previous_output = from_hypothesis.previous_output
+                    if self.output_lookup is not None:
+                        previous_output = torch.tensor(
+                            [[self.output_symbol_id_for_action(
+                                input_,
+                                action,
+                                from_hypothesis.alignment,
+                            )]],
+                            device=self.device,
+                            dtype=torch.long,
+                        )
 
                     hypothesis = Hypothesis(
                         action_history=action_history,
                         alignment=alignment,
                         decoder=expansion.decoder,
                         negative_log_p=expansion.negative_log_p,
-                        output=output)
+                        output=output,
+                        previous_output=previous_output)
 
                     beam.append(hypothesis)
 
@@ -750,5 +1124,20 @@ class Transducer(torch.nn.Module):
 
                 complete_hypotheses.append(complete_hypothesis)
 
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            mean_active = sum(beam_sizes) / len(beam_sizes) if beam_sizes else 0.
+            logging.debug(
+                "Beam stats: requested_width=%d max_active=%d "
+                "decoder_calls=%d expansions=%d steps=%d completed=%d "
+                "mean_active=%.2f",
+                beam_width,
+                max_active_beam,
+                n_decoder_calls,
+                n_expansions,
+                hypothesis_length,
+                len(complete_hypotheses),
+                mean_active,
+            )
+
         complete_hypotheses.sort(reverse=True)
-        return complete_hypotheses
+        return complete_hypotheses[:num_outputs_needed]

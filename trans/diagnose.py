@@ -105,6 +105,8 @@ def load_model_args(metadata_path: str, device: str) -> argparse.Namespace:
     model_args = metadata["args"]
     model_args.setdefault("enc_output_dropout", 0.)
     model_args.setdefault("enc_output_dropout_type", "locked")
+    model_args.setdefault("output_feedback_dim", 0)
+    model_args.setdefault("expert_temperature", 0.)
     model_args.setdefault("source_separator", None)
     model_args.setdefault("target_separator", None)
     model_args["device"] = device
@@ -159,6 +161,11 @@ def diagnose_sample(
     decoder = model.h0_c0
     alignment = torch.tensor([0], device=model.device)
     action_history = torch.tensor([[vocabulary.BEGIN_WORD]], device=model.device)
+    previous_output = torch.tensor(
+        [[model.vocab.encode_output_symbol(vocabulary.BOS_OUTPUT)]],
+        device=model.device,
+        dtype=torch.long,
+    )
     prediction_so_far = []
     true_input_length = torch.tensor([len(sample.input) + 1], device=model.device)
 
@@ -179,6 +186,7 @@ def diagnose_sample(
                 decoder,
                 alignment,
                 action_history[-1].unsqueeze(dim=0),
+                previous_output if model.output_lookup is not None else None,
             )
             logits = model.W(decoder_output)
             log_probs = model.log_softmax(logits, valid_actions_mask)[0, 0]
@@ -189,7 +197,22 @@ def diagnose_sample(
                 alignment.item(),
                 prediction_so_far,
             )
+            action_scores = model.expert_action_scores(
+                sample.input,
+                sample.target,
+                alignment.item(),
+                prediction_so_far,
+            )
             alignment_int = alignment.item()
+            best_cost = min(action_scores.values())
+            model_action = model.vocab.decode_action(action_id)
+            model_cost_gap = action_scores.get(model_action, float("inf")) - best_cost
+            non_optimal_gaps = [
+                cost - best_cost
+                for action, cost in action_scores.items()
+                if cost > best_cost
+            ]
+            best_non_oracle_cost_gap = min(non_optimal_gaps) if non_optimal_gaps else ""
             oracle_logps = [(a, log_probs[a].item()) for a in oracle_action_ids]
             oracle_mass_logp = logsumexp(logp for _, logp in oracle_logps)
             model_logp = log_probs[action_id].item()
@@ -218,6 +241,8 @@ def diagnose_sample(
                 "step": step,
                 "alignment": alignment_int,
                 "output_so_far": model.target_tokenizer.untokenize(prediction_so_far),
+                "previous_output": model.vocab.target_symbols.decode(
+                    previous_output[0, 0].item()),
                 "model_action": action_label_at_state(
                     sample.input,
                     alignment_int,
@@ -232,6 +257,8 @@ def diagnose_sample(
                 "oracle_mass_logp": oracle_mass_logp,
                 "oracle_mass_prob": math.exp(oracle_mass_logp),
                 "oracle_margin_logp": margin,
+                "model_cost_gap": model_cost_gap,
+                "best_non_oracle_cost_gap": best_non_oracle_cost_gap,
                 "top_actions": format_action_distribution(
                     model.vocab,
                     top_action_items(model.vocab, log_probs, top_k),
@@ -247,6 +274,16 @@ def diagnose_sample(
             if char:
                 prediction_so_far.append(char)
             action_history = torch.cat((action_history, action_tensor))
+            if model.output_lookup is not None:
+                previous_output = torch.tensor(
+                    [[model.output_symbol_id_for_action(
+                        sample.input,
+                        action,
+                        step_rows[-1]["alignment"],
+                    )]],
+                    device=model.device,
+                    dtype=torch.long,
+                )
             decoder = next_decoder
             if stop:
                 break
@@ -322,9 +359,10 @@ def main(args: argparse.Namespace) -> None:
     ]
     step_fields = [
         "line_number", "source", "gold", "target", "prediction", "correct", "step",
-        "alignment", "output_so_far", "model_action", "model_action_id",
+        "alignment", "output_so_far", "previous_output", "model_action", "model_action_id",
         "model_logp", "model_prob", "oracle_optimal", "oracle_actions",
         "oracle_mass_logp", "oracle_mass_prob", "oracle_margin_logp",
+        "model_cost_gap", "best_non_oracle_cost_gap",
         "top_actions",
     ]
     write_tsv(summary_path, summary_rows, summary_fields)

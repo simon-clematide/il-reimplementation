@@ -195,6 +195,15 @@ class TestGridSearchCommands(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Could not parse"):
                 grid_search.last_value_from_file(malformed)
 
+    def test_last_value_from_file_prefers_string_accuracy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            eval_file = os.path.join(tmp, "dev_greedy.eval")
+            with open(eval_file, "w") as f:
+                f.write("dev symbol accuracy: 0.9\n")
+                f.write("dev string accuracy: 0.5\n")
+
+            self.assertEqual(0.5, grid_search.last_value_from_file(eval_file))
+
     def test_write_to_results_file_uses_per_result_beam_width(self):
         with tempfile.TemporaryDirectory() as tmp:
             results_file = os.path.join(tmp, "results.txt")

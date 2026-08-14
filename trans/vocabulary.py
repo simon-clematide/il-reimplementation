@@ -9,6 +9,8 @@ from trans.actions import BeginOfSequence, ConditionalCopy, ConditionalDel, \
 
 UNK_CHAR = "<UNK>"
 PAD_CHAR = "<PAD>"
+BOS_OUTPUT = "<BOS_OUTPUT>"
+NO_OUTPUT = "<NO_OUTPUT>"
 
 
 class Vocabulary:
@@ -76,11 +78,21 @@ class Vocabularies:
 
     def __init__(self, characters: Optional[Iterable[str]] = None,
                  actions: Optional[Iterable[Any]] = None,
+                 target_symbols: Optional[Iterable[Any]] = None,
                  source_separator: Optional[str] = None,
                  target_separator: Optional[str] = None):
         self.characters = Vocabulary(characters)
         self.actions = ActionVocabulary(actions)
-        self.target_characters = set()
+        self.target_symbols = Vocabulary(
+            target_symbols if target_symbols is not None else [BOS_OUTPUT, NO_OUTPUT])
+        self.target_characters = {
+            symbol for symbol in self.target_symbols.to_i2w()
+            if symbol not in (BOS_OUTPUT, NO_OUTPUT)
+        }
+        for action in self.actions.i2w:
+            if isinstance(action, (ConditionalIns, ConditionalSub)):
+                self.target_characters.add(action.new)
+                self.target_symbols.encode(action.new)
         self.source_separator = source_separator
         self.target_separator = target_separator
 
@@ -97,7 +109,11 @@ class Vocabularies:
                 continue
             self.actions.encode(ConditionalSub(c))
             self.actions.encode(ConditionalIns(c))
+            self.target_symbols.encode(c)
             self.target_characters.add(c)
+
+    def encode_output_symbol(self, symbol: Any) -> int:
+        return self.target_symbols.lookup(symbol)
 
     def encode_unseen_input(self, input_: str) -> List[int]:
         encoded_input = [BEGIN_WORD]
@@ -117,6 +133,7 @@ class Vocabularies:
     def persist(self, filename: str):
         vocabularies = {"characters": self.characters.to_i2w(),
                         "actions": self.actions.to_i2w(),
+                        "target_symbols": self.target_symbols.to_i2w(),
                         "source_separator": self.source_separator,
                         "target_separator": self.target_separator}
         with open(filename, mode="wb") as w:
@@ -127,6 +144,7 @@ class Vocabularies:
         logging.info("Loading vocabulary from file: %s", path2pkl)
         with open(path2pkl, "rb") as w:
             params: Dict = pickle.load(w)
+        params.setdefault("target_symbols", None)
         return cls(**params)
 
     @property
@@ -174,6 +192,7 @@ class FeatureVocabularies(Vocabularies):
     def persist(self, filename: str):
         vocabularies = {"characters": self.characters.to_i2w(),
                         "actions": self.actions.to_i2w(),
+                        "target_symbols": self.target_symbols.to_i2w(),
                         "features": self.features.to_i2w(),
                         "source_separator": self.source_separator,
                         "target_separator": self.target_separator}

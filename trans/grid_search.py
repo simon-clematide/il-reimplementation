@@ -146,12 +146,17 @@ def last_value_from_file(file_path: str, t=float):
         lines = [line.strip() for line in f if line.strip()]
         if not lines:
             raise ValueError(f"Empty evaluation file: {file_path}")
+        metric_lines = [
+            line for line in lines
+            if "string accuracy" in line or line.startswith("accuracy")
+        ]
+        line = metric_lines[-1] if metric_lines else lines[-1]
         try:
-            return t(lines[-1].split()[-1])
+            return t(line.split()[-1])
         except (IndexError, ValueError) as exc:
             raise ValueError(
                 f"Could not parse evaluation result from {file_path}: "
-                f"{lines[-1]!r}") from exc
+                f"{line!r}") from exc
 
 
 def summarize_scores(scores: List[float]) -> tuple:
@@ -337,6 +342,16 @@ def write_to_results_file(results_file: str, results: List[dict]):
                 f.write("\n")
 
 
+def is_run_complete(output_dir: str) -> bool:
+    """Check if a training run has completed successfully.
+
+    A run is considered complete if dev_greedy.eval exists, which indicates
+    that training finished and evaluation was performed.
+    """
+    dev_eval_path = os.path.join(output_dir, "dev_greedy.eval")
+    return os.path.isfile(dev_eval_path)
+
+
 def write_experiment_metadata(output_dir: str, config_dict: dict,
                               comb_dict: dict, parallel_jobs: int,
                               ensemble: bool) -> None:
@@ -423,6 +438,11 @@ def main(args: argparse.Namespace):
                                     "--test", test
                                 ]
                             )
+
+                        # Skip if run is already complete (when --resume is enabled)
+                        if getattr(args, "resume", False) and is_run_complete(output):
+                            print(f"Skipping completed run: {name}/{lang}/{i}/{i}.{j}")
+                            continue
 
                         process_manager.wait_for_slot()
                         command = build_train_command(ext_args)
@@ -580,6 +600,8 @@ def cli_main():
                         help="Max number of parallel trainings. Defaults to 30 for CPU-only grids and 4 if any grid uses a non-CPU device.")
     parser.add_argument("--ensemble", action="store_true",
                         help="Produce ensemble results.")
+    parser.add_argument("--resume", action="store_true",
+                        help="Skip runs that have already completed (have dev_greedy.eval file).")
 
     args = parser.parse_args()
     main(args)

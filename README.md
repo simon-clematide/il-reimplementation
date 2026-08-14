@@ -82,6 +82,36 @@ use ``--enc-output-dropout``. The default output-dropout type is locked dropout:
 
         --enc-output-dropout 0.3 --enc-output-dropout-type locked
 
+The decoder can optionally receive feedback about the symbol emitted by the
+previous action. This is disabled by default and preserves the historical
+action-feedback architecture:
+
+        --output-feedback-dim 0
+
+Set a positive dimension, for example ``--output-feedback-dim 32``, to append a
+previous-output embedding to the decoder input. The feedback symbols include
+``<BOS_OUTPUT>``, ``<NO_OUTPUT>``, and the target symbols used by insertion and
+substitution actions.
+
+The default training objective is the hard set-valued oracle loss. To give
+near-optimal expert actions partial credit according to their SED cost gap, set
+a positive soft-oracle temperature:
+
+        --expert-temperature 2
+
+At temperature ``0.0`` the historical hard oracle loss is used.
+For positive temperatures, ``--expert-loss marginal`` keeps the weighted
+oracle-mass objective, while ``--expert-loss normalized_ce`` trains against the
+normalized soft expert distribution over finite expert-supported actions:
+
+        --expert-temperature 2 --expert-loss normalized_ce
+
+The fixed-margin expert loss ranks at least one expert-optimal action above all
+other decoder-valid actions by a logit margin. It does not use the SED cost-gap
+magnitudes or ``--expert-temperature``:
+
+        --expert-loss margin --expert-margin 1.0
+
 SED parameters are estimated during training unless ``--sed-params`` points to
 an existing ``sed.pkl`` file. The default SED estimator is damped EM:
 
@@ -92,6 +122,105 @@ When training fits a new SED model, it writes both ``sed.pkl`` and
 ``sed.pkl.json``. The JSON sidecar records the training input path, token
 separators, EM settings, corpus size, alphabets, git commit, and full training
 arguments.
+
+#### Training option compatibility
+
+The command-line help shows all defaults:
+
+        trans-train --help
+
+Some options are alternatives or only meaningful in specific modes:
+
+* ``--train`` is required for ordinary training. If ``--precomputed-train`` is
+  used instead, ``--vocabulary`` must also be supplied. Conversely,
+  ``--precomputed-train`` and ``--vocabulary`` are a pair: do not provide only
+  one of them.
+* ``--save-precomputed-train`` only has an effect when training examples are
+  precomputed from ``--train`` during the current run.
+* ``--source-separator`` and ``--target-separator`` define the tokenization used
+  to build the vocabulary, SED expert, action vocabulary, checkpoints, and
+  diagnostics. Use the same separator settings when creating ``sed.pkl``,
+  training the neural model, and running diagnostics. If you load an existing
+  ``--vocabulary`` or model metadata, its stored separators should be treated as
+  authoritative.
+* ``--sed-params`` loads an existing SED model. If it is omitted, training fits a
+  new SED model using ``--sed-em-iterations``, ``--sed-em-mode``, and
+  ``--sed-em-damping``. These EM options do not refit or modify an already
+  supplied ``--sed-params`` file.
+* ``--sed-em-mode strict`` is the paper-faithful EM estimator.
+  ``--sed-em-mode damped`` is the project default for backward-compatible
+  training behavior; it interpolates the strict EM estimate with the previous
+  parameters using ``--sed-em-damping``.
+* ``--expert-temperature 0`` uses the historical hard set-valued oracle loss.
+  With positive temperatures, ``--expert-loss marginal`` and
+  ``--expert-loss normalized_ce`` use SED cost gaps and therefore require expert
+  action-cost precomputation.
+* ``--expert-loss margin`` ignores ``--expert-temperature`` and SED cost-gap
+  magnitudes. It uses ``--expert-margin`` to rank the best expert-optimal action
+  above decoder-valid alternatives.
+* If you use ``--precomputed-train`` from an older run, regenerate it after
+  changing options that alter expert/training tensors, especially
+  ``--source-separator``, ``--target-separator``, ``--output-feedback-dim``, or
+  positive-temperature expert losses. Periodic model roll-in refreshes
+  regenerate trajectories from each sample's stored input and target, so loaded
+  precomputed data must come from a compatible tokenizer/vocabulary setup.
+* ``--output-feedback-dim 0`` disables previous-output feedback. A positive
+  value requires output histories in precomputed training data; newly
+  precomputed data includes them automatically.
+* ``--rollin-prob 0`` disables imitation-learning trajectory refreshes and
+  reproduces fixed expert trajectories. With a positive value, training starts
+  from expert trajectories and periodically refreshes cached trajectories from
+  states partly induced by the current model. ``--rollin-start`` selects the
+  first refresh epoch, ``--rollin-refresh`` selects the refresh period, and
+  ``--rollin-policy greedy`` uses the current greedy decoder-valid model action
+  when roll-in is selected. ``--rollin-seed`` controls only the model/expert
+  roll-in choices and defaults to ``--pytorch-seed`` when available. Expert
+  supervision is still computed by the SED expert at every visited state;
+  roll-in only changes the visited state distribution. Roll-in trajectories are
+  capped by the smaller of the global decoder limit and a source/target-length
+  dependent bound, and refresh logs report truncations.
+* For LSTM encoders, ``--enc-dropout`` affects only stacked recurrent encoders
+  with ``--enc-layers`` greater than 1. Use ``--enc-output-dropout`` for
+  one-layer encoders. ``--enc-output-dropout-type none`` disables explicit output
+  dropout regardless of the numeric dropout value.
+* Scheduler-specific options such as ``--factor``, ``--lrs-patience``, and
+  ``--cooldown`` are only used with ``--scheduler reduce_on_plateau``.
+  Optimizer-specific options are similarly used only by the selected
+  ``--optimizer``.
+* ``--eval-batch-size`` defaults to ``--batch-size`` when omitted. Beam search
+  evaluation is enabled only when ``--beam-width`` is greater than 0; greedy
+  decoding is always evaluated. Beam search keeps the live beam at the requested
+  width and returns up to that many completed hypotheses per input. With
+  ``--verbose``, beam decoding logs debug counters such as active beam size,
+  decoder calls, expansions, steps, and completed hypotheses. As a temporary
+  workaround for slow accelerator beam decoding, final beam evaluation runs from
+  a CPU copy of the best checkpoint when training uses ``--device mps`` or
+  ``--device cuda``; greedy evaluation remains on the selected device.
+* Development-set checkpoint selection maximizes exact string accuracy first.
+  If two epochs have the same string accuracy, the tie-breaker is higher symbol
+  accuracy, computed as ``1 -`` total token-level Levenshtein distance divided
+  by the total number of reference symbols. String accuracy and symbol accuracy
+  are reported in logs, checkpoint metadata, and evaluation files.
+* ``--device mps``/``cuda`` runs the neural model on the accelerator. Expert
+  precomputation and mask construction are CPU-side bookkeeping and are moved to
+  the selected device before neural training.
+
+Common controlled objective comparisons:
+
+        # Historical hard oracle
+        --expert-temperature 0 --expert-loss marginal
+
+        # Cost-sensitive marginal oracle mass
+        --expert-temperature 2 --expert-loss marginal
+
+        # Normalized soft expert distribution
+        --expert-temperature 2 --expert-loss normalized_ce
+
+        # Fixed-margin logit ranking; temperature is unused
+        --expert-loss margin --expert-margin 1.0
+
+        # Periodic imitation-learning trajectory refresh
+        --rollin-prob 0.2 --rollin-start 5 --rollin-refresh 5 --rollin-seed 42
 
 ### Ensembling
 To ensemble a number of models based on majority voting, run the python script 
@@ -155,7 +284,7 @@ The command writes two TSV files:
   and the oracle probability mass at the first policy deviation.
 * ``diagnostic_steps.tsv``: one row per decoded action with the model action,
   model probability, expert-optimal action set, oracle-set probability mass,
-  oracle margin, and top model actions.
+  oracle margin, expert cost gaps, and top model actions.
 
 #### Configuration file
 The JSON-based configuration file needs to be passed via ``--config`` parameter.

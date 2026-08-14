@@ -85,6 +85,17 @@ class VocabularyTests(unittest.TestCase):
         self.assertIn(ConditionalSub("d͡ʒ"), vocabulary1.actions.i2w)
         self.assertNotIn(ConditionalSub("͡"), vocabulary1.actions.i2w)
 
+    def test_target_symbols_cover_generated_actions(self):
+        vocabulary1 = vocabulary.Vocabularies()
+        vocabulary1.encode_actions(["a", "d͡ʒ"])
+
+        for action in vocabulary1.actions.i2w:
+            if isinstance(action, (ConditionalIns, ConditionalSub)):
+                self.assertNotEqual(
+                    vocabulary.UNK,
+                    vocabulary1.encode_output_symbol(action.new),
+                )
+
     def test_vocabularies_encode_unseen_input(self):
         encoded_fox = self.vocabularies.encode_unseen_input("fox")
         self.assertListEqual([0, 4, 5, 3, 1], encoded_fox)

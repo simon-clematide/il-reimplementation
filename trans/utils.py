@@ -46,7 +46,9 @@ class Sample:
     target: Optional[str]
     encoded_input: Optional[torch.tensor] = None
     action_history: Optional[torch.tensor] = None
+    output_history: Optional[torch.tensor] = None
     alignment_history: Optional[torch.tensor] = None
+    expert_action_costs: Optional[torch.tensor] = None
     optimal_actions_mask: Optional[torch.tensor] = None
     valid_actions_mask: Optional[torch.tensor] = None
     features: Optional[str] = None
@@ -55,7 +57,9 @@ class Sample:
     _tensor_attrs = (
         "encoded_input",
         "action_history",
+        "output_history",
         "alignment_history",
+        "expert_action_costs",
         "optimal_actions_mask",
         "valid_actions_mask",
         "encoded_features",
@@ -73,7 +77,9 @@ class Sample:
 class TrainingBatch:
     encoded_input: torch.tensor
     action_history: torch.tensor
+    output_history: Optional[torch.tensor]
     alignment_history: torch.tensor
+    expert_action_costs: Optional[torch.tensor]
     optimal_actions_mask: torch.tensor
     valid_actions_mask: torch.tensor
     encoded_features: Optional[torch.tensor] = None
@@ -109,46 +115,82 @@ class Dataset(torch.utils.data.Dataset):
             if 'pad_index' not in kwargs:
                 pad_index = PAD
 
+            target_device = torch.device(device)
+
+            def cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
+                return tensor.to("cpu")
+
+            def to_target_device(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+                if tensor is None:
+                    return None
+                return tensor.to(target_device)
+
+            def pad_sequence_on_cpu(
+                    sequences: List[torch.Tensor],
+                    **pad_kwargs) -> torch.Tensor:
+                return torch.nn.utils.rnn.pad_sequence(
+                    [cpu_tensor(s) for s in sequences],
+                    **pad_kwargs,
+                )
+
+            def nonnegative_cpu_tensor(tensor: torch.Tensor,
+                                       replacement: int) -> torch.Tensor:
+                tensor = cpu_tensor(tensor)
+                return tensor.masked_fill(tensor < 0, replacement)
+
             def batch_encode_features(batch: List[Sample]):
                 """Creates a padded batch of encoded features."""
                 if batch[0].encoded_features is None:
                     encoded_features = None
                 else:
-                    features_ = [list(s.encoded_features) for s in batch]
+                    features_ = [list(cpu_tensor(s.encoded_features)) for s in batch]
                     max_len = len(max(features_, key=len))
-                    pad = torch.tensor(pad_index, device=device)
+                    pad = torch.tensor(pad_index)
                     padded_features = [
                         f + [pad] * (max_len - len(f))
                         for f in features_
                     ]
-                    encoded_features = torch.tensor(padded_features, device=device)
-                return encoded_features
+                    encoded_features = torch.tensor(padded_features)
+                return to_target_device(encoded_features)
 
             if is_training:
                 def collate(batch: List[Sample]):
-                    max_len = len(max([s.encoded_input for s in batch], key=len)) - 2
                     return TrainingBatch(
-                        torch.nn.utils.rnn.pad_sequence([s.encoded_input for s in batch],
-                                                        batch_first=True,
-                                                        padding_value=pad_index),
-                        torch.nn.utils.rnn.pad_sequence([s.action_history for s in batch],
-                                                        padding_value=pad_index),
-                        torch.nn.utils.rnn.pad_sequence([s.alignment_history for s in batch],
-                                                        batch_first=True,
-                                                        padding_value=max_len).view(-1),
-                        torch.nn.utils.rnn.pad_sequence([s.optimal_actions_mask for s in batch],
-                                                        padding_value=False),
-                        torch.nn.utils.rnn.pad_sequence([s.valid_actions_mask for s in batch],
-                                                        padding_value=False),
+                        to_target_device(pad_sequence_on_cpu(
+                            [s.encoded_input for s in batch],
+                            batch_first=True,
+                            padding_value=pad_index)),
+                        to_target_device(pad_sequence_on_cpu(
+                            [nonnegative_cpu_tensor(s.action_history, PAD) for s in batch],
+                            padding_value=PAD)),
+                        to_target_device(pad_sequence_on_cpu(
+                            [nonnegative_cpu_tensor(s.output_history, PAD) for s in batch],
+                            padding_value=PAD,
+                        )) if batch[0].output_history is not None else None,
+                        to_target_device(pad_sequence_on_cpu(
+                            [nonnegative_cpu_tensor(s.alignment_history, 0) for s in batch],
+                            batch_first=True,
+                            padding_value=0).view(-1)),
+                        to_target_device(pad_sequence_on_cpu(
+                            [s.expert_action_costs for s in batch],
+                            padding_value=float("inf"),
+                        )) if batch[0].expert_action_costs is not None else None,
+                        to_target_device(pad_sequence_on_cpu(
+                            [s.optimal_actions_mask for s in batch],
+                            padding_value=False)),
+                        to_target_device(pad_sequence_on_cpu(
+                            [s.valid_actions_mask for s in batch],
+                            padding_value=False)),
                         encoded_features=batch_encode_features(batch),
                     )
             else:
                 def collate(batch: List[Sample]):
                     return EvalBatch([s.input for s in batch],
                                      [s.target for s in batch],
-                                     torch.nn.utils.rnn.pad_sequence([s.encoded_input for s in batch],
-                                                                     batch_first=True,
-                                                                     padding_value=pad_index),
+                                     to_target_device(pad_sequence_on_cpu(
+                                         [s.encoded_input for s in batch],
+                                         batch_first=True,
+                                         padding_value=pad_index)),
                                      features=[s.features for s in batch],
                                      encoded_features=batch_encode_features(batch),
                                      )
@@ -179,9 +221,14 @@ class Dataset(torch.utils.data.Dataset):
 
 @dataclasses.dataclass
 class DecodingOutput:
-    accuracy: float
+    string_accuracy: float
+    symbol_accuracy: float
     loss: float
     predictions: List[str]
+
+    @property
+    def accuracy(self) -> float:
+        return self.string_accuracy
 
 
 class OpenNormalize:
@@ -217,11 +264,14 @@ class OpenNormalize:
         self.file.close()
 
 
-def write_results(accuracy: float, predictions: List[str], output: str,
+def write_results(string_accuracy: float, predictions: List[str], output: str,
                   normalize: bool, dataset_name: str, beam_width: int = 1,
+                  symbol_accuracy: Optional[float] = None,
                   decoding_name: Optional[str] = None,
                   dargs: Dict[str, Any] = None):
-    logging.info("%s set accuracy: %.4f.", dataset_name.title(), accuracy)
+    logging.info("%s set string accuracy: %.4f.", dataset_name.title(), string_accuracy)
+    if symbol_accuracy is not None:
+        logging.info("%s set symbol accuracy: %.4f.", dataset_name.title(), symbol_accuracy)
 
     if decoding_name is None:
         decoding_name = "greedy" if beam_width == 1 else f"beam{beam_width}"
@@ -232,7 +282,9 @@ def write_results(accuracy: float, predictions: List[str], output: str,
         if dargs is not None:
             for key, value in dargs.items():
                 w.write(f"{key}: {value}\n")
-        w.write(f"{dataset_name} accuracy: {accuracy:.4f}\n")
+        if symbol_accuracy is not None:
+            w.write(f"{dataset_name} symbol accuracy: {symbol_accuracy:.4f}\n")
+        w.write(f"{dataset_name} string accuracy: {string_accuracy:.4f}\n")
 
     predictions_tsv = os.path.join(
         output, f"{dataset_name}_{decoding_name}.predictions")

@@ -130,6 +130,7 @@ class DiagnoseTests(unittest.TestCase):
             self.assertIn("first_non_optimal_step", summary_rows[0])
             self.assertGreaterEqual(len(step_rows), 1)
             self.assertEqual("b", step_rows[0]["gold"])
+            self.assertIn("previous_output", step_rows[0])
             self.assertIn("oracle_actions", step_rows[0])
             self.assertIn("oracle_mass_prob", step_rows[0])
             self.assertIn("top_actions", step_rows[0])
