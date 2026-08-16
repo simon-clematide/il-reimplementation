@@ -24,6 +24,8 @@ class ParamDict:
     delta_del: Dict[Any, float]
     delta_ins: Dict[Any, float]
     delta_eos: float
+    source_alphabet: Optional[Tuple[Any, ...]] = None
+    target_alphabet: Optional[Tuple[Any, ...]] = None
 
     def sum(self) -> float:
         values = [self.delta_eos]
@@ -36,14 +38,18 @@ class ParamDict:
         return cls(delta_sub=dict(other.delta_sub),
                    delta_del=dict(other.delta_del),
                    delta_ins=dict(other.delta_ins),
-                   delta_eos=other.delta_eos)
+                   delta_eos=other.delta_eos,
+                   source_alphabet=getattr(other, "source_alphabet", None),
+                   target_alphabet=getattr(other, "target_alphabet", None))
 
     @classmethod
     def zeros_like(cls, other: "ParamDict"):
         return cls(delta_sub={k: LOG_ZERO for k in other.delta_sub},
                    delta_del={k: LOG_ZERO for k in other.delta_del},
                    delta_ins={k: LOG_ZERO for k in other.delta_ins},
-                   delta_eos=LOG_ZERO)
+                   delta_eos=LOG_ZERO,
+                   source_alphabet=getattr(other, "source_alphabet", None),
+                   target_alphabet=getattr(other, "target_alphabet", None))
 
 
 class StochasticEditDistance(actions.Aligner):
@@ -59,15 +65,39 @@ class StochasticEditDistance(actions.Aligner):
     def __init__(self, params: ParamDict, *args, **kwargs) -> None:
 
         self.params = params
+        self.params.source_alphabet = self._source_alphabet(params)
+        self.params.target_alphabet = self._target_alphabet(params)
         self.delta_sub = params.delta_sub
         self.delta_del = params.delta_del
         self.delta_ins = params.delta_ins
         self.delta_eos = params.delta_eos
+        self.source_alphabet = self.params.source_alphabet
+        self.target_alphabet = self.params.target_alphabet
         self.default = DEFAULT_UNKNOWN_LOG_PROB  # floor for unseen inputs / outputs
 
         if not np.isclose(0., self.params.sum()):
             raise ValueError(
                 f"Parameters do not sum to 1!: {self.params.sum():.4f}.")
+
+    @staticmethod
+    def _source_alphabet(params: ParamDict) -> Tuple[Any, ...]:
+        source_alphabet = getattr(params, "source_alphabet", None)
+        if source_alphabet is not None:
+            return tuple(source_alphabet)
+        return tuple(sorted(
+            set(params.delta_del) |
+            {source for source, _ in params.delta_sub}
+        ))
+
+    @staticmethod
+    def _target_alphabet(params: ParamDict) -> Tuple[Any, ...]:
+        target_alphabet = getattr(params, "target_alphabet", None)
+        if target_alphabet is not None:
+            return tuple(target_alphabet)
+        return tuple(sorted(
+            set(params.delta_ins) |
+            {target for _, target in params.delta_sub}
+        ))
 
     @classmethod
     def build_sed(cls, source_alphabet: Iterable[Any],
@@ -109,7 +139,14 @@ class StochasticEditDistance(actions.Aligner):
         delta_del = {s: log_rest_prob for s in source_alphabet}
         delta_ins = {t: log_rest_prob for t in target_alphabet}
         delta_eos = log_rest_prob
-        params = ParamDict(delta_sub, delta_del, delta_ins, delta_eos)
+        params = ParamDict(
+            delta_sub,
+            delta_del,
+            delta_ins,
+            delta_eos,
+            source_alphabet=tuple(sorted(source_alphabet)),
+            target_alphabet=tuple(sorted(target_alphabet)),
+        )
         return cls(params)
 
     @classmethod
@@ -330,6 +367,8 @@ class StochasticEditDistance(actions.Aligner):
             },
             delta_eos=cls.interpolate_log_probabilities(
                 old_params.delta_eos, em_params.delta_eos, damping),
+            source_alphabet=em_params.source_alphabet,
+            target_alphabet=em_params.target_alphabet,
         )
 
     def m_step(self, gammas: ParamDict, damping: float = 1.) -> None:
@@ -354,6 +393,8 @@ class StochasticEditDistance(actions.Aligner):
         self.delta_del = gammas.delta_del
         self.delta_ins = gammas.delta_ins
         self.delta_eos = gammas.delta_eos
+        self.source_alphabet = gammas.source_alphabet
+        self.target_alphabet = gammas.target_alphabet
 
     def viterbi_distance(self, source: Sequence, target: Sequence,
                          with_alignment: bool = False) -> \
@@ -469,17 +510,81 @@ class StochasticEditDistance(actions.Aligner):
 
         return -self.viterbi_distance(source=x[x_offset:], target=y[y_offset:])
 
+    def map_cost(self, source_symbol: Any, target_symbol: Any) -> float:
+        return -self.delta_sub.get((source_symbol, target_symbol), self.default)
+
+    def delete_cost(self, source_symbol: Any) -> float:
+        return -self.delta_del.get(source_symbol, self.default)
+
+    def insert_cost(self, target_symbol: Any) -> float:
+        return -self.delta_ins.get(target_symbol, self.default)
+
+    def event_table(self) -> List[Dict[str, Any]]:
+        rows = []
+        for (source_symbol, target_symbol), log_probability in sorted(
+                self.delta_sub.items()):
+            rows.append({
+                "event": "map",
+                "source": source_symbol,
+                "target": target_symbol,
+                "log_probability": log_probability,
+                "probability": float(np.exp(log_probability)),
+                "cost": -log_probability,
+            })
+        for source_symbol, log_probability in sorted(self.delta_del.items()):
+            rows.append({
+                "event": "delete",
+                "source": source_symbol,
+                "target": "",
+                "log_probability": log_probability,
+                "probability": float(np.exp(log_probability)),
+                "cost": -log_probability,
+            })
+        for target_symbol, log_probability in sorted(self.delta_ins.items()):
+            rows.append({
+                "event": "insert",
+                "source": "",
+                "target": target_symbol,
+                "log_probability": log_probability,
+                "probability": float(np.exp(log_probability)),
+                "cost": -log_probability,
+            })
+        rows.append({
+            "event": "eos",
+            "source": "",
+            "target": "",
+            "log_probability": self.delta_eos,
+            "probability": float(np.exp(self.delta_eos)),
+            "cost": -self.delta_eos,
+        })
+        return rows
+
+    def top_mappings(self, source_symbol: Any, limit: Optional[int] = None
+                     ) -> List[Dict[str, Any]]:
+        mappings = [
+            {
+                "source": source,
+                "target": target,
+                "log_probability": log_probability,
+                "probability": float(np.exp(log_probability)),
+                "cost": -log_probability,
+                "identity": source == target,
+            }
+            for (source, target), log_probability in self.delta_sub.items()
+            if source == source_symbol
+        ]
+        mappings.sort(key=lambda row: row["log_probability"], reverse=True)
+        return mappings if limit is None else mappings[:limit]
+
     def action_cost(self, action: Edit) -> float:
+        if isinstance(action, Copy):
+            return self.map_cost(action.old, action.old)
         if isinstance(action, Del):
-            return -self.delta_del.get(action.old, self.default)
+            return self.delete_cost(action.old)
         if isinstance(action, Ins):
-            return -self.delta_ins.get(action.new, self.default)
+            return self.insert_cost(action.new)
         if isinstance(action, Sub):
-            return -self.delta_sub.get(
-                (action.old, action.new), self.default)
+            return self.map_cost(action.old, action.new)
         if isinstance(action, EndOfSequence):
             return -self.delta_eos
-        if isinstance(action, Copy):
-            return -self.delta_sub.get(
-                (action.old, action.old), self.default)
         raise ValueError(f"Unknown action!: {action}!")

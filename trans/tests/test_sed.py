@@ -4,7 +4,7 @@ import unittest
 
 import numpy as np
 
-from trans.actions import Del, Sub, Ins
+from trans.actions import Copy, Del, Sub, Ins
 from trans import sed
 from trans.tests import test_optimal_expert_substitutions
 
@@ -28,6 +28,74 @@ class TestTransducer(unittest.TestCase):
         for weight_dict in ("delta_del", "delta_ins", "delta_sub"):
             for weight in getattr(sed_, weight_dict).values():
                 self.assertTrue(np.isclose(eos_weight, weight))
+
+    def test_sed_records_distinct_source_and_target_alphabets(self):
+        sed_ = sed.StochasticEditDistance.build_sed(
+            source_alphabet=["a", "e"],
+            target_alphabet=["e", "ɛ"],
+            copy_probability=None,
+        )
+
+        self.assertEqual(("a", "e"), sed_.source_alphabet)
+        self.assertEqual(("e", "ɛ"), sed_.target_alphabet)
+        self.assertIn(("e", "e"), sed_.delta_sub)
+        self.assertIn(("e", "ɛ"), sed_.delta_sub)
+        self.assertNotEqual(sed_.source_alphabet, sed_.target_alphabet)
+
+    def test_old_paramdict_derives_alphabets_from_event_tables(self):
+        params = sed.ParamDict(
+            delta_sub={("e", "ɛ"): np.log(0.25)},
+            delta_del={"e": np.log(0.25)},
+            delta_ins={"ɛ": np.log(0.25)},
+            delta_eos=np.log(0.25),
+        )
+        params.source_alphabet = None
+        params.target_alphabet = None
+
+        sed_ = sed.StochasticEditDistance(params)
+
+        self.assertEqual(("e",), sed_.source_alphabet)
+        self.assertEqual(("ɛ",), sed_.target_alphabet)
+
+    def test_copy_cost_is_learned_identity_map_cost(self):
+        params = sed.ParamDict(
+            delta_sub={
+                ("e", "e"): np.log(0.20),
+                ("e", "ɛ"): np.log(0.40),
+            },
+            delta_del={"e": np.log(0.10)},
+            delta_ins={"e": np.log(0.10), "ɛ": np.log(0.10)},
+            delta_eos=np.log(0.10),
+            source_alphabet=("e",),
+            target_alphabet=("e", "ɛ"),
+        )
+        sed_ = sed.StochasticEditDistance(params)
+
+        self.assertTrue(np.isclose(
+            sed_.map_cost("e", "e"),
+            sed_.action_cost(Copy("e", "e")),
+        ))
+        self.assertTrue(np.isclose(
+            sed_.map_cost("e", "ɛ"),
+            sed_.action_cost(Sub("e", "ɛ")),
+        ))
+        self.assertLess(
+            sed_.action_cost(Sub("e", "ɛ")),
+            sed_.action_cost(Copy("e", "e")),
+        )
+
+    def test_event_table_and_top_mappings_are_inspectable(self):
+        sed_ = sed.StochasticEditDistance.build_sed(
+            "e", "eɛ", copy_probability=None)
+
+        event_rows = sed_.event_table()
+        mapping_rows = sed_.top_mappings("e")
+
+        self.assertTrue(any(
+            row["event"] == "map" and row["source"] == "e" and row["target"] == "ɛ"
+            for row in event_rows
+        ))
+        self.assertEqual({"e", "ɛ"}, {row["target"] for row in mapping_rows})
 
     def test_sed_copy_biased_initialization(self):
 

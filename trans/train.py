@@ -1,5 +1,6 @@
 """Trains a grapheme-to-phoneme neural transducer."""
 import argparse
+import collections
 import copy
 import dataclasses
 import json
@@ -55,18 +56,65 @@ def optimizer_learning_rates(optimizer: torch.optim.Optimizer) -> list[float]:
     return [param_group["lr"] for param_group in optimizer.param_groups]
 
 
+def learning_rates_changed(before: list[float], after: list[float]) -> bool:
+    return before != after
+
+
 def log_learning_rate_change(
         before: list[float],
         optimizer: torch.optim.Optimizer,
         scheduler_name: str) -> None:
     after = optimizer_learning_rates(optimizer)
-    if before != after:
+    if learning_rates_changed(before, after):
         logging.info(
             "Learning rate changed by %s scheduler: %s -> %s.",
             scheduler_name,
             before,
             after,
         )
+
+
+def build_optimizer_and_scheduler(
+        model: transducer.Transducer,
+        args: argparse.Namespace) -> tuple[torch.optim.Optimizer, Optional[object]]:
+    optimizer = OPTIMIZER_MAPPING[args.optimizer](model.parameters(), args)
+    scheduler = None
+    if args.scheduler is not None:
+        scheduler = LR_SCHEDULER_MAPPING[args.scheduler](optimizer, args)
+    return optimizer, scheduler
+
+
+def set_optimizer_learning_rates(
+        optimizer: torch.optim.Optimizer,
+        learning_rates: list[float]) -> None:
+    if len(learning_rates) != len(optimizer.param_groups):
+        raise ValueError(
+            "Cannot restore learning rates: number of learning rates does not "
+            "match optimizer parameter groups."
+        )
+    for param_group, learning_rate in zip(optimizer.param_groups, learning_rates):
+        param_group["lr"] = learning_rate
+
+
+def reload_best_model_and_reset_optimizer(
+        model: transducer.Transducer,
+        args: argparse.Namespace,
+        best_model_path: str,
+        learning_rates: list[float]) -> tuple[torch.optim.Optimizer, Optional[object]]:
+    if not os.path.exists(best_model_path):
+        raise RuntimeError(
+            f"Cannot reload best model after learning-rate reduction; "
+            f"{best_model_path} does not exist."
+        )
+    model.load_state_dict(torch.load(best_model_path, map_location=model.device))
+    optimizer, scheduler = build_optimizer_and_scheduler(model, args)
+    set_optimizer_learning_rates(optimizer, learning_rates)
+    logging.info(
+        "Reloaded best model from %s and reset optimizer state at learning rates %s.",
+        best_model_path,
+        learning_rates,
+    )
+    return optimizer, scheduler
 
 
 def current_git_commit() -> str:
@@ -110,6 +158,7 @@ def write_sed_metadata(path: str, args: argparse.Namespace,
         "em_iterations": args.sed_em_iterations,
         "em_mode": args.sed_em_mode,
         "em_damping": args.sed_em_damping,
+        "copy_probability": None,
         "num_samples": len(training_data.samples),
         "source_alphabet_size": len(vocabulary_.characters.to_i2w()),
         "target_alphabet_size": len(vocabulary_.target_characters),
@@ -118,6 +167,23 @@ def write_sed_metadata(path: str, args: argparse.Namespace,
     }
     with open(path, "w") as w:
         json.dump(metadata, w, indent=2, sort_keys=True)
+
+
+def configure_output_file_logging(output_dir: str,
+                                  filename: str = "training.info.log") -> str:
+    os.makedirs(output_dir, exist_ok=True)
+    log_path = os.path.join(output_dir, filename)
+    root_logger = logging.getLogger()
+    abs_log_path = os.path.abspath(log_path)
+    for handler in root_logger.handlers:
+        if isinstance(handler, logging.FileHandler) and \
+                os.path.abspath(handler.baseFilename) == abs_log_path:
+            return log_path
+    file_handler = logging.FileHandler(log_path, mode="w")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+    root_logger.addHandler(file_handler)
+    return log_path
 
 
 def best_non_optimal_cost_gaps(training_data: utils.Dataset) -> list[float]:
@@ -159,7 +225,8 @@ def soft_expert_distribution_statistics(
             weights = torch.exp(-gaps / temperature)
             probs = weights / torch.sum(weights)
             optimal_mass = torch.sum(probs[gaps == 0]).item()
-            entropy = -torch.sum(probs * torch.log(probs)).item()
+            positive_probs = probs[probs > 0]
+            entropy = -torch.sum(positive_probs * torch.log(positive_probs)).item()
             optimal_masses.append(optimal_mass)
             entropies.append(entropy)
             effective_sizes.append(float(np.exp(entropy)))
@@ -226,6 +293,94 @@ def log_margin_statistics(stats: dict[str, float]) -> None:
     if active > 0:
         logging.info("Mean active margin loss: %.4f.",
                      stats["active_loss_sum"] / active)
+
+
+def log_focal_statistics(stats: dict[str, list[torch.Tensor]]) -> None:
+    oracle_masses = stats["oracle_masses"]
+    focal_weights = stats["focal_weights"]
+    if not oracle_masses:
+        return
+    oracle_mass = torch.cat(oracle_masses).numpy()
+    focal_weight = torch.cat(focal_weights).numpy()
+    logging.info("Focal states: %d.", len(oracle_mass))
+    logging.info(
+        "Focal oracle mass: mean %.4f p10 %.4f p50 %.4f p90 %.4f.",
+        np.mean(oracle_mass),
+        np.percentile(oracle_mass, 10),
+        np.percentile(oracle_mass, 50),
+        np.percentile(oracle_mass, 90),
+    )
+    logging.info(
+        "Focal weight: mean %.4f p90 %.4f.",
+        np.mean(focal_weight),
+        np.percentile(focal_weight, 90),
+    )
+
+
+def log_contrastive_statistics(stats: dict) -> None:
+    states = stats["states"]
+    if states == 0:
+        return
+    logging.info("Contrastive states: %d.", states)
+    logging.info("Contrastive active: %.4f.", stats["active"] / states)
+    logging.info("Contrastive accuracy: %.4f.",
+                 stats["ranking_correct"] / states)
+    logging.info("Contrastive margin satisfied: %.4f.",
+                 stats["margin_satisfied"] / states)
+    decoder_top_states = stats["decoder_top_states"]
+    if decoder_top_states > 0:
+        logging.info(
+            "Decoder top action: optimal %.4f finite-expert %.4f excluded %.4f.",
+            stats["decoder_top_optimal"] / decoder_top_states,
+            stats["decoder_top_finite"] / decoder_top_states,
+            stats["decoder_top_excluded"] / decoder_top_states,
+        )
+    logging.info("Mean contrastive loss: %.4f.",
+                 stats["loss_sum"] / states)
+    if stats["positive_count_sum"] > 0:
+        logging.info("Contrastive positive set size: mean %.4f max %d.",
+                     stats["positive_count_sum"] / states,
+                     stats["positive_count_max"])
+    hard_negative_total = (
+        stats["negative_finite_expert"] + stats["negative_expert_excluded"])
+    if hard_negative_total > 0:
+        logging.info(
+            "Contrastive hard negatives: finite expert cost %d (%.2f%%), "
+            "no expert cost %d (%.2f%%).",
+            stats["negative_finite_expert"],
+            100 * stats["negative_finite_expert"] / hard_negative_total,
+            stats["negative_expert_excluded"],
+            100 * stats["negative_expert_excluded"] / hard_negative_total,
+        )
+    if stats["gap_count"] > 0:
+        logging.info("Mean hard-negative expert gap: %.4f.",
+                     stats["gap_sum"] / stats["gap_count"])
+    negative_type_counts = stats["negative_type_counts"]
+    if negative_type_counts:
+        total = sum(negative_type_counts.values())
+        logging.info("Contrastive hard-negative action types:")
+        for action_type, count in sorted(negative_type_counts.items()):
+            logging.info("\t%s: %d (%.2f%%)",
+                         action_type, count, 100 * count / total)
+    decoder_error_type_counts = stats["decoder_error_type_counts"]
+    if decoder_error_type_counts:
+        total = sum(decoder_error_type_counts.values())
+        logging.info("Decoder top nonoptimal action types:")
+        for action_type, count in sorted(decoder_error_type_counts.items()):
+            logging.info("\t%s: %d (%.2f%%)",
+                         action_type, count, 100 * count / total)
+    if stats["delete_gap_count"] > 0:
+        delete_count = stats["delete_gap_count"]
+        logging.info(
+            "DELETE hard negatives: count %d; mean expert gap %.4f; "
+            "mean logit advantage %.4f; ranking correct %.4f; "
+            "margin satisfied %.4f.",
+            delete_count,
+            stats["delete_gap_sum"] / delete_count,
+            stats["delete_logit_advantage_sum"] / delete_count,
+            stats["delete_ranking_correct"] / delete_count,
+            stats["delete_margin_satisfied"] / delete_count,
+        )
 
 
 def focal_gamma_schedule(epoch: int, target_gamma: float,
@@ -351,6 +506,25 @@ class RollinStats:
     model_controlled: int = 0
     model_expert_agree: int = 0
     model_non_optimal: int = 0
+    critic_states: int = 0
+    critic_new_actions: int = 0
+    critic_better_actions: int = 0
+    critic_equal_actions: int = 0
+    critic_regret_sum: float = 0.
+    critic_finite_gaps: list[float] = dataclasses.field(default_factory=list)
+    critic_infinite_gaps: int = 0
+    critic_gaps_by_action_type: dict[str, list[float]] = dataclasses.field(
+        default_factory=dict)
+    critic_infinite_gaps_by_action_type: dict[str, int] = dataclasses.field(
+        default_factory=dict)
+    critic_old_costs_by_action_type: dict[str, list[float]] = dataclasses.field(
+        default_factory=dict)
+    critic_prefix_costs_by_action_type: dict[str, list[float]] = dataclasses.field(
+        default_factory=dict)
+    critic_continuation_costs_by_action_type: dict[str, list[float]] = dataclasses.field(
+        default_factory=dict)
+    critic_new_totals_by_action_type: dict[str, list[float]] = dataclasses.field(
+        default_factory=dict)
     truncated: int = 0
     trajectory_lengths: list[int] = dataclasses.field(default_factory=list)
 
@@ -359,6 +533,26 @@ class RollinStats:
         self.model_controlled += other.model_controlled
         self.model_expert_agree += other.model_expert_agree
         self.model_non_optimal += other.model_non_optimal
+        self.critic_states += other.critic_states
+        self.critic_new_actions += other.critic_new_actions
+        self.critic_better_actions += other.critic_better_actions
+        self.critic_equal_actions += other.critic_equal_actions
+        self.critic_regret_sum += other.critic_regret_sum
+        self.critic_finite_gaps.extend(other.critic_finite_gaps)
+        self.critic_infinite_gaps += other.critic_infinite_gaps
+        for action_type, gaps in other.critic_gaps_by_action_type.items():
+            self.critic_gaps_by_action_type.setdefault(action_type, []).extend(gaps)
+        for action_type, count in other.critic_infinite_gaps_by_action_type.items():
+            self.critic_infinite_gaps_by_action_type[action_type] = \
+                self.critic_infinite_gaps_by_action_type.get(action_type, 0) + count
+        for action_type, costs in other.critic_old_costs_by_action_type.items():
+            self.critic_old_costs_by_action_type.setdefault(action_type, []).extend(costs)
+        for action_type, costs in other.critic_prefix_costs_by_action_type.items():
+            self.critic_prefix_costs_by_action_type.setdefault(action_type, []).extend(costs)
+        for action_type, costs in other.critic_continuation_costs_by_action_type.items():
+            self.critic_continuation_costs_by_action_type.setdefault(action_type, []).extend(costs)
+        for action_type, costs in other.critic_new_totals_by_action_type.items():
+            self.critic_new_totals_by_action_type.setdefault(action_type, []).extend(costs)
         self.truncated += other.truncated
         self.trajectory_lengths.extend(other.trajectory_lengths)
 
@@ -384,6 +578,149 @@ def log_rollin_stats(epoch: int, probability: float, stats: RollinStats) -> None
     logging.info("\tnon-optimal model actions: %d (%.1f%%)", stats.model_non_optimal, non_optimal)
     logging.info("\ttruncated trajectories: %d", stats.truncated)
     logging.info("\tmean trajectory length: %.1f", mean_length)
+    log_critic_stats(stats)
+
+
+def log_critic_stats(stats: RollinStats) -> None:
+    if stats.critic_states:
+        novel_pct = 100 * stats.critic_new_actions / stats.critic_states
+        already_pct = 100 - novel_pct
+        better_pct = 100 * stats.critic_better_actions / stats.critic_states
+        mean_regret = (
+            stats.critic_regret_sum / stats.critic_new_actions
+            if stats.critic_new_actions else 0.
+        )
+        logging.info("Model-action critic:")
+        logging.info("\tstates scored: %d", stats.critic_states)
+        logging.info("\talready in expert set: %.1f%%", already_pct)
+        logging.info("\tnovel model actions: %d (%.1f%%)",
+                     stats.critic_new_actions, novel_pct)
+        logging.info("\tnovel actions better than reference best: %d (%.1f%%)",
+                     stats.critic_better_actions, better_pct)
+        logging.info("\tnovel actions equal to SED best: %d",
+                     stats.critic_equal_actions)
+        logging.info("\tmean novel cost gap: %.4f", mean_regret)
+        log_critic_gap_distribution(stats)
+
+
+def critic_action_type(action: object) -> str:
+    name = action.__class__.__name__
+    for prefix in ("Conditional",):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+    if name == "EndOfSequence":
+        return "EOS"
+    return name.upper()
+
+
+def record_critic_gap(stats: RollinStats, action_type: str, gap: float) -> None:
+    if np.isfinite(gap):
+        stats.critic_finite_gaps.append(gap)
+        stats.critic_gaps_by_action_type.setdefault(action_type, []).append(gap)
+    else:
+        stats.critic_infinite_gaps += 1
+        stats.critic_infinite_gaps_by_action_type[action_type] = \
+            stats.critic_infinite_gaps_by_action_type.get(action_type, 0) + 1
+
+
+def record_decoder_state_critic(
+        stats: RollinStats,
+        action_type: str,
+        old_cost: float,
+        prefix_cost: float,
+        continuation_cost: float,
+        new_total: float) -> None:
+    if np.isfinite(old_cost):
+        stats.critic_old_costs_by_action_type.setdefault(action_type, []).append(old_cost)
+    if np.isfinite(prefix_cost):
+        stats.critic_prefix_costs_by_action_type.setdefault(action_type, []).append(prefix_cost)
+    if np.isfinite(continuation_cost):
+        stats.critic_continuation_costs_by_action_type.setdefault(action_type, []).append(
+            continuation_cost)
+    if np.isfinite(new_total):
+        stats.critic_new_totals_by_action_type.setdefault(action_type, []).append(new_total)
+
+
+def log_critic_gap_distribution(stats: RollinStats) -> None:
+    if not stats.critic_new_actions:
+        return
+    finite_gaps = np.array(stats.critic_finite_gaps, dtype=float)
+    logging.info("Novel critic cost-gap distribution:")
+    if finite_gaps.size:
+        for label, value in zip(
+                ("min", "p25", "p50", "p75", "p90", "p95", "p99", "max"),
+                np.percentile(finite_gaps, [0, 25, 50, 75, 90, 95, 99, 100])):
+            logging.info("\t%s: %.4f", label, value)
+        buckets = [
+            ("gap == 0", finite_gaps == 0),
+            ("0 < gap <= 1", (finite_gaps > 0) & (finite_gaps <= 1)),
+            ("1 < gap <= 2", (finite_gaps > 1) & (finite_gaps <= 2)),
+            ("2 < gap <= 5", (finite_gaps > 2) & (finite_gaps <= 5)),
+            ("5 < gap <= 10", (finite_gaps > 5) & (finite_gaps <= 10)),
+            ("gap > 10", finite_gaps > 10),
+        ]
+        for label, mask in buckets:
+            logging.info("\t%s: %d", label, int(np.sum(mask)))
+    else:
+        logging.info("\tfinite gaps: 0")
+    logging.info("\tinvalid/infinite: %d", stats.critic_infinite_gaps)
+    logging.info("Novel critic cost-gap by action type:")
+    action_types = sorted(
+        set(stats.critic_gaps_by_action_type) |
+        set(stats.critic_infinite_gaps_by_action_type))
+    for action_type in action_types:
+        gaps = np.array(
+            stats.critic_gaps_by_action_type.get(action_type, []),
+            dtype=float,
+        )
+        invalid = stats.critic_infinite_gaps_by_action_type.get(action_type, 0)
+        if gaps.size:
+            le_one = int(np.sum(gaps <= 1))
+            logging.info(
+                "\t%s count=%d median=%.4f <=1=%d invalid=%d",
+                action_type,
+                gaps.size + invalid,
+                np.percentile(gaps, 50),
+                le_one,
+                invalid,
+            )
+        else:
+            logging.info(
+                "\t%s count=%d median=nan <=1=0 invalid=%d",
+                action_type,
+                invalid,
+                invalid,
+            )
+    if stats.critic_new_totals_by_action_type:
+        logging.info("Decoder-state critic costs by action type:")
+        action_types = sorted(
+            set(stats.critic_old_costs_by_action_type) |
+            set(stats.critic_prefix_costs_by_action_type) |
+            set(stats.critic_continuation_costs_by_action_type) |
+            set(stats.critic_new_totals_by_action_type))
+        for action_type in action_types:
+            old_costs = stats.critic_old_costs_by_action_type.get(action_type, [])
+            prefix_costs = stats.critic_prefix_costs_by_action_type.get(action_type, [])
+            continuation_costs = \
+                stats.critic_continuation_costs_by_action_type.get(action_type, [])
+            new_totals = stats.critic_new_totals_by_action_type.get(action_type, [])
+            logging.info(
+                "\t%s count=%d old-median=%s prefix-median=%s "
+                "continuation-median=%s new-total-median=%s",
+                action_type,
+                len(new_totals),
+                format_optional_median(old_costs),
+                format_optional_median(prefix_costs),
+                format_optional_median(continuation_costs),
+                format_optional_median(new_totals),
+            )
+
+
+def format_optional_median(values: list[float]) -> str:
+    if not values:
+        return "nan"
+    return f"{np.median(values):.4f}"
+
 
 
 def should_refresh_rollin(epoch: int, start: int, refresh: int,
@@ -445,7 +782,9 @@ def model_greedy_rollin_action(
 def precompute_from_expert(s: utils.Sample, transducer_: transducer.Transducer,
                            device: str = 'cpu', rollin_prob: float = 0.,
                            rollin_policy: str = "expert",
-                           rollin_rng: Optional[random.Random] = None) -> RollinStats:
+                           rollin_rng: Optional[random.Random] = None,
+                           critic_model_action: bool = False,
+                           critic_augment_model_action: bool = False) -> RollinStats:
     """ Precompute the optimal policy (optimal and valid actions as well as the alignment) from the expert.
 
     Args:
@@ -482,6 +821,7 @@ def precompute_from_expert(s: utils.Sample, transducer_: transducer.Transducer,
     while not stop and len(action_history) <= max_rollout_actions:
         stats.states += 1
         action_scores = transducer_.expert_action_scores(s.input, s.target, a, output)
+        original_action_scores = dict(action_scores)
         for action, value in action_scores.items():
             transducer_.encode_known_action(
                 action,
@@ -489,8 +829,6 @@ def precompute_from_expert(s: utils.Sample, transducer_: transducer.Transducer,
                 f"input={s.input!r}, target={s.target!r}, "
                 f"alignment={a}, prediction={output!r}, score={value}",
             )
-        expert_action_costs.append(
-            transducer_.encode_expert_action_costs(action_scores, device=device))
         optimal_value = min(action_scores.values())
         actions = [
             transducer_.encode_known_action(
@@ -503,17 +841,82 @@ def precompute_from_expert(s: utils.Sample, transducer_: transducer.Transducer,
             if value == optimal_value
         ]
         optimal_action_history.append(actions)
+        if critic_augment_model_action:
+            action_scores = {
+                action: transducer_.expert_score_decoder_action(
+                    s.input,
+                    s.target,
+                    a,
+                    output,
+                    transducer_.encode_known_action(
+                        action,
+                        "precompute_from_expert critic augmentation: "
+                        f"input={s.input!r}, target={s.target!r}, "
+                        f"alignment={a}, prediction={output!r}, action={action}",
+                    ),
+                ).total
+                for action in original_action_scores
+            }
         # todo: allow optimization of multiple target actions
-        rollout_action = actions[0]
-        if rollin_policy == "greedy" and rollin_rng.random() < rollin_prob:
-            stats.model_controlled += 1
-            rollout_action = model_greedy_rollin_action(
+        model_action = None
+        follow_model = rollin_policy == "greedy" and rollin_rng.random() < rollin_prob
+        if critic_model_action or follow_model:
+            model_action = model_greedy_rollin_action(
                 s,
                 transducer_,
                 alignment_history,
                 action_history,
                 output_history,
             )
+        if critic_model_action and model_action is not None:
+            stats.critic_states += 1
+            critic_action = transducer_.expert_action_from_id(s.input, model_action, a)
+            if critic_action not in original_action_scores:
+                old_model_cost = transducer_.expert_score_action(
+                    s.input,
+                    s.target,
+                    a,
+                    output,
+                    model_action,
+                )
+                decoder_state_score = transducer_.expert_score_decoder_action(
+                    s.input,
+                    s.target,
+                    a,
+                    output,
+                    model_action,
+                )
+                model_cost = decoder_state_score.total
+                reference_best_cost = min(action_scores.values())
+                if critic_augment_model_action:
+                    action_scores[critic_action] = model_cost
+                stats.critic_new_actions += 1
+                regret = model_cost - reference_best_cost
+                stats.critic_regret_sum += regret
+                action_type = critic_action_type(critic_action)
+                record_critic_gap(
+                    stats,
+                    action_type,
+                    regret,
+                )
+                record_decoder_state_critic(
+                    stats,
+                    action_type,
+                    old_model_cost,
+                    decoder_state_score.prefix_cost,
+                    decoder_state_score.continuation_cost,
+                    decoder_state_score.total,
+                )
+                if model_cost < reference_best_cost:
+                    stats.critic_better_actions += 1
+                elif model_cost == reference_best_cost:
+                    stats.critic_equal_actions += 1
+        expert_action_costs.append(
+            transducer_.encode_expert_action_costs(action_scores, device=device))
+        rollout_action = actions[0]
+        if follow_model:
+            stats.model_controlled += 1
+            rollout_action = model_action
             if rollout_action in actions:
                 stats.model_expert_agree += 1
             else:
@@ -594,12 +997,13 @@ def refresh_precomputed_training(
                 rollin_prob=rollin_prob,
                 rollin_policy=rollin_policy,
                 rollin_rng=rollin_rng,
+                critic_model_action=args.critic_model_action,
+                critic_augment_model_action=args.critic_augment_model_action,
             ))
     if transducer_was_training:
         transducer_.train()
-    if epoch is not None and rollin_prob > 0:
+    if epoch is not None and (rollin_prob > 0 or args.critic_model_action):
         log_rollin_stats(epoch, rollin_prob, stats)
-    training_data.to(args.device)
     return stats
 
 
@@ -607,10 +1011,11 @@ def main(args: argparse.Namespace):
     args.source_separator = utils.Tokenizer.from_cli(args.source_separator).separator
     args.target_separator = utils.Tokenizer.from_cli(args.target_separator).separator
 
+    log_path = configure_output_file_logging(args.output)
+    logging.info("Writing detailed training log to %s.", log_path)
+
     for key, value in vars(args).items():
         logging.info("%s: %s", str(key).ljust(15), value)
-
-    os.makedirs(args.output, exist_ok=True)
 
     if args.pytorch_seed is not None:
         torch.manual_seed(args.pytorch_seed)
@@ -785,9 +1190,18 @@ def main(args: argparse.Namespace):
         precompute_progress_bar = progressbar.ProgressBar(
             widgets=widgets, maxval=len(training_data.samples)
         ).start()
+        precompute_stats = RollinStats()
         for i, s in enumerate(training_data.samples):
-            precompute_from_expert(s, transducer_, device="cpu")
+            precompute_stats.update(precompute_from_expert(
+                s,
+                transducer_,
+                device="cpu",
+                critic_model_action=args.critic_model_action,
+                critic_augment_model_action=args.critic_augment_model_action,
+            ))
             precompute_progress_bar.update(i)
+        if args.critic_model_action:
+            log_critic_stats(precompute_stats)
 
         if args.save_precomputed_train:
             precomputed_train_path = os.path.join(args.output, "precomputed_train.pkl")
@@ -798,6 +1212,13 @@ def main(args: argparse.Namespace):
             "Using fixed-margin expert loss with expert_margin=%.4f; "
             "expert_temperature is unused.",
             args.expert_margin,
+        )
+    elif args.expert_loss == "contrastive":
+        logging.info(
+            "Using contrastive expert loss with expert_margin=%.4f, "
+            "contrastive_negative=%s; expert_temperature is unused.",
+            args.expert_margin,
+            args.contrastive_negative,
         )
     else:
         log_expert_gap_statistics(training_data, args.expert_temperature)
@@ -830,10 +1251,7 @@ def main(args: argparse.Namespace):
     with open(train_log_path, "w") as w:
         w.write("epoch\tavg_loss\ttrain_string_accuracy\tdev_string_accuracy\tdev_symbol_accuracy\n")
 
-    optimizer = OPTIMIZER_MAPPING[args.optimizer](transducer_.parameters(), args)
-    scheduler = None
-    if args.scheduler is not None:
-        scheduler = LR_SCHEDULER_MAPPING[args.scheduler](optimizer, args)
+    optimizer, scheduler = build_optimizer_and_scheduler(transducer_, args)
     train_subset_loader = build_train_subset_loader()
     # rollin_schedule = inverse_sigmoid_schedule(args.k)
     max_patience = args.patience
@@ -892,6 +1310,34 @@ def main(args: argparse.Namespace):
                 "margin_count": 0,
                 "active_loss_sum": 0.,
             }
+            focal_statistics = {
+                "oracle_masses": [],
+                "focal_weights": [],
+            }
+            contrastive_statistics = {
+                "states": 0,
+                "active": 0,
+                "ranking_correct": 0,
+                "margin_satisfied": 0,
+                "decoder_top_states": 0,
+                "decoder_top_optimal": 0,
+                "decoder_top_finite": 0,
+                "decoder_top_excluded": 0,
+                "loss_sum": 0.,
+                "gap_sum": 0.,
+                "gap_count": 0,
+                "negative_finite_expert": 0,
+                "negative_expert_excluded": 0,
+                "positive_count_sum": 0,
+                "positive_count_max": 0,
+                "negative_type_counts": collections.Counter(),
+                "decoder_error_type_counts": collections.Counter(),
+                "delete_gap_sum": 0.,
+                "delete_gap_count": 0,
+                "delete_logit_advantage_sum": 0.,
+                "delete_ranking_correct": 0,
+                "delete_margin_satisfied": 0,
+            }
             # rollin not implemented at the moment
             # rollin = rollin_schedule(epoch)
             j = 0
@@ -908,6 +1354,20 @@ def main(args: argparse.Namespace):
                 if transducer_.last_margin_statistics is not None:
                     for key, value in transducer_.last_margin_statistics.items():
                         margin_statistics[key] += value
+                if transducer_.last_focal_statistics is not None:
+                    focal_statistics["oracle_masses"].append(
+                        transducer_.last_focal_statistics["oracle_masses"])
+                    focal_statistics["focal_weights"].append(
+                        transducer_.last_focal_statistics["focal_weights"])
+                if transducer_.last_contrastive_statistics is not None:
+                    for key, value in transducer_.last_contrastive_statistics.items():
+                        if key in {"negative_type_counts", "decoder_error_type_counts"}:
+                            contrastive_statistics[key].update(value)
+                        elif key == "positive_count_max":
+                            contrastive_statistics[key] = max(
+                                contrastive_statistics[key], value)
+                        else:
+                            contrastive_statistics[key] += value
                 train_loss += torch.mean(losses.squeeze(dim=0)).item()  # mean per batch
                 scale = accumulation_loss_scale(j, batch_count, args.grad_accumulation)
                 reduced_loss = reduce_loss(losses) / scale
@@ -928,6 +1388,10 @@ def main(args: argparse.Namespace):
         logging.info("Average train loss: %.4f.", avg_loss)
         if args.expert_loss == "margin":
             log_margin_statistics(margin_statistics)
+        if args.expert_loss == "focal_marginal":
+            log_focal_statistics(focal_statistics)
+        if args.expert_loss == "contrastive":
+            log_contrastive_statistics(contrastive_statistics)
 
         transducer_.eval()
         with torch.no_grad():
@@ -951,6 +1415,15 @@ def main(args: argparse.Namespace):
             lrs_before = optimizer_learning_rates(optimizer)
             scheduler.step(dev_accuracy)
             log_learning_rate_change(lrs_before, optimizer, args.scheduler)
+            lrs_after = optimizer_learning_rates(optimizer)
+            if args.reload_best_on_lr_reduction and \
+                    learning_rates_changed(lrs_before, lrs_after):
+                optimizer, scheduler = reload_best_model_and_reset_optimizer(
+                    transducer_,
+                    args,
+                    best_model_path,
+                    lrs_after,
+                )
 
         selection_key = model_selection_key(dev_accuracy, dev_symbol_accuracy)
         if selection_key > best_selection_key:
@@ -1100,11 +1573,15 @@ def cli_main():
     parser.add_argument("--expert-temperature", type=float, default=0.,
                         help="Soft oracle temperature. A value of 0 uses the hard set-valued oracle loss.")
     parser.add_argument("--expert-loss",
-                        choices=["marginal", "focal_marginal", "normalized_ce", "margin"],
+                        choices=[
+                            "marginal", "focal_marginal", "normalized_ce",
+                            "margin", "contrastive",
+                        ],
                         default="marginal",
                         help="Expert training objective. marginal uses hard set-valued oracle mass; "
                              "focal_marginal focalizes hard oracle mass; normalized_ce matches the "
-                             "normalized soft expert distribution; margin uses fixed-margin logit ranking.")
+                             "normalized soft expert distribution; margin uses fixed-margin logit ranking; "
+                             "contrastive ranks the expert-optimal set above non-optimal expert actions.")
     parser.add_argument("--focal-gamma", type=float, default=1.0,
                         help="Focusing parameter for --expert-loss=focal_marginal. gamma=0 recovers ordinary marginal training.")
     parser.add_argument("--focal-start", type=int, default=0,
@@ -1112,7 +1589,17 @@ def cli_main():
     parser.add_argument("--focal-ramp", type=int, default=0,
                         help="Number of epochs over which focal gamma is linearly ramped to --focal-gamma. A value <= 0 uses the target gamma immediately at --focal-start.")
     parser.add_argument("--expert-margin", type=float, default=1.0,
-                        help="Logit margin for --expert-loss=margin.")
+                        help="Logit margin for --expert-loss=margin or contrastive.")
+    parser.add_argument("--contrastive-negative",
+                        choices=["hard", "all"],
+                        default="hard",
+                        help="Negative set for --expert-loss=contrastive. hard uses the highest-logit non-optimal action; all aggregates all finite non-optimal actions.")
+    parser.add_argument("--critic-model-action", action="store_true",
+                        help="Score and report the model's greedy action when it is not already scored by the expert. "
+                             "This is diagnostic-only unless --critic-augment-model-action is also set.")
+    parser.add_argument("--critic-augment-model-action", action="store_true",
+                        help="Also add the scored greedy model action to the SED expert cost distribution. "
+                             "Requires --critic-model-action.")
     parser.add_argument("--rollin-prob", type=float, default=0.0,
                         help="Probability of following the current model during periodic imitation-learning "
                              "trajectory refresh. A value of 0 disables roll-in refreshes.")
@@ -1157,6 +1644,10 @@ def cli_main():
     parser.add_argument("--scheduler", type=str,
                         choices=LR_SCHEDULER_MAPPING.keys(),
                         help="Scheduler used in training.")
+    parser.add_argument("--reload-best-on-lr-reduction",
+                        action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="When reduce_on_plateau lowers the learning rate, reload best.model and reset optimizer state at the reduced learning rate.")
     parser.add_argument("--sed-em-iterations", type=int, default=10,
                         help="SED EM iterations.")
     # Project default: keep damped EM for existing training behavior. This is a
@@ -1207,6 +1698,12 @@ def cli_main():
         parser.error("--focal-start must be nonnegative.")
     if args.expert_loss == "focal_marginal" and args.expert_temperature != 0:
         parser.error("--expert-loss=focal_marginal requires --expert-temperature=0.")
+    if args.expert_loss == "contrastive" and args.expert_temperature != 0:
+        parser.error("--expert-loss=contrastive requires --expert-temperature=0.")
+    if args.critic_augment_model_action and not args.critic_model_action:
+        parser.error("--critic-augment-model-action requires --critic-model-action.")
+    if args.reload_best_on_lr_reduction and args.scheduler != "reduce_on_plateau":
+        parser.error("--reload-best-on-lr-reduction requires --scheduler=reduce_on_plateau.")
 
     # custom logic for handling mutually inclusive/exclusive set of options
     # --> train, precomputed_train and vocabulary

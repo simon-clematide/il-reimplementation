@@ -5,6 +5,7 @@ import functools
 import heapq
 import argparse
 import logging
+import collections
 
 import torch
 import numpy as np
@@ -13,7 +14,8 @@ from trans import optimal_expert
 from trans import utils
 from trans import vocabulary
 from trans.actions import ConditionalCopy, ConditionalDel, ConditionalIns, \
-    ConditionalSub, Edit, EndOfSequence, GenerativeEdit, BeginOfSequence
+    ConditionalSub, Copy, Del, Edit, EndOfSequence, GenerativeEdit, \
+    BeginOfSequence, Ins, Sub
 from trans.vocabulary import BEGIN_WORD, COPY, DELETE, END_WORD, PAD, \
     FeatureVocabularies
 from trans import ENCODER_MAPPING
@@ -52,6 +54,13 @@ class Hypothesis:
     previous_output: Optional[torch.tensor] = None
 
 
+@dataclasses.dataclass(frozen=True)
+class ActionEffect:
+    output_symbol: Optional[Any]
+    alignment_delta: int
+    stop: bool
+
+
 @functools.total_ordering
 @dataclasses.dataclass
 class Expansion:
@@ -80,17 +89,24 @@ class Transducer(torch.nn.Module):
         if self.expert_temperature < 0:
             raise ValueError("expert_temperature must be nonnegative.")
         self.expert_loss = getattr(args, "expert_loss", "marginal")
-        if self.expert_loss not in {"marginal", "focal_marginal", "normalized_ce", "margin"}:
+        if self.expert_loss not in {
+                "marginal", "focal_marginal", "normalized_ce", "margin",
+                "contrastive"}:
             raise ValueError(
                 "expert_loss must be one of: marginal, focal_marginal, "
-                "normalized_ce, margin.")
+                "normalized_ce, margin, contrastive.")
         self.focal_gamma = getattr(args, "focal_gamma", 1.0)
         if self.focal_gamma < 0:
             raise ValueError("focal_gamma must be nonnegative.")
         self.expert_margin = getattr(args, "expert_margin", 1.0)
         if self.expert_margin < 0:
             raise ValueError("expert_margin must be nonnegative.")
+        self.contrastive_negative = getattr(args, "contrastive_negative", "hard")
+        if self.contrastive_negative not in {"hard", "all"}:
+            raise ValueError("contrastive_negative must be one of: hard, all.")
         self.last_margin_statistics = None
+        self.last_focal_statistics = None
+        self.last_contrastive_statistics = None
         self.source_tokenizer = utils.Tokenizer.from_cli(
             getattr(args, "source_separator", getattr(vocab, "source_separator", None)))
         self.target_tokenizer = utils.Tokenizer.from_cli(
@@ -362,6 +378,131 @@ class Transducer(torch.nn.Module):
             input_, target, alignment, prediction)
         return self.remap_actions(raw_action_scores)
 
+    def expert_action_from_id(self, input_: Union[str, List[str]],
+                              action_id: int,
+                              alignment: Union[int, torch.tensor]) -> Edit:
+        if torch.is_tensor(alignment):
+            alignment = alignment.item()
+        action = self.vocab.decode_action(action_id)
+        if isinstance(action, (ConditionalCopy, ConditionalDel, ConditionalIns,
+                               ConditionalSub, EndOfSequence)):
+            return action
+        raise ValueError(f"Cannot convert decoder action to expert action: {action}.")
+
+    def concrete_expert_action_from_id(self, input_: Union[str, List[str]],
+                                       action_id: int,
+                                       alignment: Union[int, torch.tensor]) -> Edit:
+        if torch.is_tensor(alignment):
+            alignment = alignment.item()
+        action = self.vocab.decode_action(action_id)
+        if isinstance(action, ConditionalCopy):
+            if alignment >= len(input_):
+                raise ValueError("Cannot copy after input is exhausted.")
+            return Copy(input_[alignment], input_[alignment])
+        if isinstance(action, ConditionalDel):
+            if alignment >= len(input_):
+                raise ValueError("Cannot delete after input is exhausted.")
+            return Del(input_[alignment])
+        if isinstance(action, ConditionalSub):
+            if alignment >= len(input_):
+                raise ValueError("Cannot substitute after input is exhausted.")
+            return Sub(input_[alignment], action.new)
+        if isinstance(action, ConditionalIns):
+            return Ins(action.new)
+        if isinstance(action, EndOfSequence):
+            return action
+        raise ValueError(f"Cannot convert decoder action to expert action: {action}.")
+
+    def action_effect(self, input_: Union[str, List[str]],
+                      alignment: Union[int, torch.tensor],
+                      action: Union[int, Edit]) -> ActionEffect:
+        if torch.is_tensor(action):
+            action = action.item()
+        if isinstance(action, int):
+            action = self.vocab.decode_action(action)
+        if torch.is_tensor(alignment):
+            alignment = alignment.item()
+        if isinstance(action, ConditionalCopy):
+            if alignment >= len(input_):
+                raise ValueError("Cannot copy after input is exhausted.")
+            return ActionEffect(input_[alignment], 1, False)
+        if isinstance(action, ConditionalDel):
+            if alignment >= len(input_):
+                raise ValueError("Cannot delete after input is exhausted.")
+            return ActionEffect(None, 1, False)
+        if isinstance(action, ConditionalIns):
+            return ActionEffect(action.new, 0, False)
+        if isinstance(action, ConditionalSub):
+            if alignment >= len(input_):
+                raise ValueError("Cannot substitute after input is exhausted.")
+            return ActionEffect(action.new, 1, False)
+        if isinstance(action, EndOfSequence):
+            return ActionEffect(None, 0, True)
+        if isinstance(action, BeginOfSequence):
+            return ActionEffect(None, 0, False)
+        raise ValueError(f"Unknown action: {action}.")
+
+    def expert_score_action(self, input_: Union[str, List[str]],
+                            target: Union[str, List[str]],
+                            alignment: int,
+                            prediction: List[str],
+                            action_id: int) -> float:
+        effect = self.action_effect(input_, alignment, action_id)
+        action = self.concrete_expert_action_from_id(input_, action_id, alignment)
+        successor_prediction = list(prediction)
+        if effect.output_symbol is not None:
+            successor_prediction.append(effect.output_symbol)
+        return (
+            self.optimal_expert.aligner.action_cost(action) +
+            self.optimal_expert.score_state(
+                input_,
+                target,
+                alignment + effect.alignment_delta,
+                successor_prediction,
+            )
+        )
+
+    def expert_score_decoder_action(self, input_: Union[str, List[str]],
+                                    target: Union[str, List[str]],
+                                    alignment: int,
+                                    prediction: List[str],
+                                    action_id: int):
+        effect = self.action_effect(input_, alignment, action_id)
+        successor_prediction = list(prediction)
+        if effect.output_symbol is not None:
+            successor_prediction.append(effect.output_symbol)
+        if effect.stop:
+            terminal_cost = optimal_expert.levenshtein_distance(
+                successor_prediction,
+                target,
+            )[-1, -1]
+            return self.optimal_expert.decoder_state_score(
+                prefix_cost=float(terminal_cost),
+                continuation_cost=0.,
+                total=float(terminal_cost),
+                target_prefix_index=len(target),
+            )
+        return self.optimal_expert.score_decoder_state(
+            input_,
+            target,
+            alignment + effect.alignment_delta,
+            successor_prediction,
+        )
+
+    def expert_score_action_direct(self, input_: Union[str, List[str]],
+                                   target: Union[str, List[str]],
+                                   alignment: int,
+                                   prediction: List[str],
+                                   action_id: int) -> float:
+        action = self.concrete_expert_action_from_id(input_, action_id, alignment)
+        return self.optimal_expert.score_action(
+            input_,
+            target,
+            alignment,
+            prediction,
+            action,
+        )
+
     def encode_expert_action_costs(
             self,
             action_scores: Dict[Any, float],
@@ -489,6 +630,13 @@ class Transducer(torch.nn.Module):
         )
         if not torch.isfinite(losses[~paddings]).all():
             raise FloatingPointError("Focal marginal loss produced non-finite values.")
+        valid_p_optimal = p_optimal[~paddings].detach().cpu()
+        valid_focal_weight = focal_weight[~paddings].detach().cpu()
+        self.last_focal_statistics = {
+            "states": int(valid_p_optimal.numel()),
+            "oracle_masses": valid_p_optimal,
+            "focal_weights": valid_focal_weight,
+        }
         return losses
 
     def soft_oracle_loss(self, logits: torch.tensor,
@@ -607,6 +755,166 @@ class Transducer(torch.nn.Module):
             "active_loss_sum": float(active_losses.sum().item()) if active_losses.numel() > 0 else 0.,
         }
         return hinge
+
+    def action_type_name(self, action_id: int) -> str:
+        action = self.vocab.decode_action(action_id)
+        if isinstance(action, ConditionalCopy):
+            return "COPY"
+        if isinstance(action, ConditionalSub):
+            return "SUB"
+        if isinstance(action, ConditionalIns):
+            return "INS"
+        if isinstance(action, ConditionalDel):
+            return "DEL"
+        if isinstance(action, EndOfSequence):
+            return "EOS"
+        return action.__class__.__name__.upper()
+
+    def contrastive_expert_loss(self, logits: torch.tensor,
+                                expert_action_costs: torch.tensor,
+                                valid_actions_mask: torch.tensor,
+                                margin: float,
+                                negative_mode: str = "hard",
+                                cost_epsilon: float = 1e-6) -> torch.tensor:
+        """Pairwise ranking loss between optimal expert set and nonoptimal actions."""
+        if negative_mode not in {"hard", "all"}:
+            raise ValueError("negative_mode must be one of: hard, all.")
+        finite_expert_mask = torch.isfinite(expert_action_costs)
+        paddings = ~torch.any(finite_expert_mask, dim=2)
+        safe_costs = expert_action_costs.clone()
+        safe_costs[~finite_expert_mask] = float("inf")
+        safe_costs[paddings, 0] = 0.
+        best_costs = torch.min(safe_costs, dim=2, keepdim=True).values
+        positive_mask = (
+            finite_expert_mask &
+            (torch.abs(expert_action_costs - best_costs) <= cost_epsilon)
+        )
+        # The decoder competes over every mechanically valid action, so the
+        # contrastive hard negative must come from the decoder-valid space, not
+        # only from actions to which the expert assigned a finite cost.
+        negative_mask = valid_actions_mask & ~positive_mask
+
+        no_positive = ~torch.any(positive_mask, dim=2)
+        no_negative = ~torch.any(negative_mask, dim=2)
+        safe_positive_mask = positive_mask.clone()
+        safe_negative_mask = negative_mask.clone()
+        safe_positive_mask[no_positive, 0] = True
+        safe_negative_mask[no_negative, 0] = True
+
+        positive_score = torch.logsumexp(
+            logits.masked_fill(~safe_positive_mask, -torch.inf),
+            dim=2,
+        )
+        negative_logits = logits.masked_fill(~safe_negative_mask, -torch.inf)
+        if negative_mode == "hard":
+            negative_score, negative_ids = negative_logits.max(dim=2)
+        else:
+            negative_score = torch.logsumexp(negative_logits, dim=2)
+            negative_ids = negative_logits.max(dim=2).indices
+        negative_ids = torch.where(
+            no_negative,
+            torch.zeros_like(negative_ids),
+            negative_ids,
+        )
+
+        losses = torch.nn.functional.softplus(
+            negative_score - positive_score + margin)
+        zero_loss = paddings | no_positive | no_negative
+        losses = torch.where(~zero_loss, losses, torch.zeros_like(losses))
+        if not torch.isfinite(losses[~paddings]).all():
+            raise FloatingPointError("Contrastive expert loss produced non-finite values.")
+
+        valid_states = ~zero_loss
+        positive_counts = positive_mask.sum(dim=2)
+        valid_positive_counts = positive_counts[valid_states]
+        ranking_correct = positive_score[valid_states] > negative_score[valid_states]
+        margin_satisfied = (
+            positive_score[valid_states] >=
+            negative_score[valid_states] + margin
+        )
+        active = losses[valid_states] > 0
+        negative_costs = torch.gather(
+            expert_action_costs,
+            dim=2,
+            index=negative_ids.unsqueeze(dim=2),
+        ).squeeze(dim=2)
+        negative_has_expert_cost = torch.isfinite(negative_costs)
+        negative_gaps = negative_costs - best_costs.squeeze(dim=2)
+        valid_gap_states = valid_states & negative_has_expert_cost
+        valid_gaps = negative_gaps[valid_gap_states]
+        decoder_top_logits = logits.masked_fill(~valid_actions_mask, -torch.inf)
+        decoder_top_ids = decoder_top_logits.max(dim=2).indices
+        decoder_top_valid_states = torch.any(valid_actions_mask, dim=2)
+        decoder_top_ids = torch.where(
+            decoder_top_valid_states,
+            decoder_top_ids,
+            torch.zeros_like(decoder_top_ids),
+        )
+        decoder_top_is_optimal = torch.gather(
+            positive_mask,
+            dim=2,
+            index=decoder_top_ids.unsqueeze(dim=2),
+        ).squeeze(dim=2)
+        decoder_top_is_finite = torch.gather(
+            finite_expert_mask,
+            dim=2,
+            index=decoder_top_ids.unsqueeze(dim=2),
+        ).squeeze(dim=2)
+        decoder_top_nonoptimal = decoder_top_valid_states & ~decoder_top_is_optimal
+        negative_type_counts = collections.Counter()
+        decoder_error_type_counts = collections.Counter()
+        delete_gap_sum = 0.
+        delete_gap_count = 0
+        delete_logit_advantage_sum = 0.
+        delete_ranking_correct = 0
+        delete_margin_satisfied = 0
+        for action_id, gap, logit_advantage, is_correct, is_satisfied in zip(
+                negative_ids[valid_states].detach().cpu().tolist(),
+                negative_gaps[valid_states].detach().cpu().tolist(),
+                (negative_score[valid_states] -
+                 positive_score[valid_states]).detach().cpu().tolist(),
+                ranking_correct.detach().cpu().tolist(),
+                margin_satisfied.detach().cpu().tolist()):
+            action_type = self.action_type_name(action_id)
+            negative_type_counts[action_type] += 1
+            if action_type == "DEL" and np.isfinite(gap):
+                delete_gap_sum += gap
+                delete_gap_count += 1
+                delete_logit_advantage_sum += logit_advantage
+                delete_ranking_correct += int(is_correct)
+                delete_margin_satisfied += int(is_satisfied)
+        for action_id in decoder_top_ids[decoder_top_nonoptimal].detach().cpu().tolist():
+            decoder_error_type_counts[self.action_type_name(action_id)] += 1
+        self.last_contrastive_statistics = {
+            "states": int(valid_states.sum().item()),
+            "active": int(active.sum().item()),
+            "ranking_correct": int(ranking_correct.sum().item()),
+            "margin_satisfied": int(margin_satisfied.sum().item()),
+            "decoder_top_states": int(decoder_top_valid_states.sum().item()),
+            "decoder_top_optimal": int(
+                decoder_top_is_optimal[decoder_top_valid_states].sum().item()),
+            "decoder_top_finite": int(
+                decoder_top_is_finite[decoder_top_valid_states].sum().item()),
+            "decoder_top_excluded": int(
+                (~decoder_top_is_finite[decoder_top_valid_states]).sum().item()),
+            "loss_sum": float(losses[valid_states].sum().item()) if valid_states.any() else 0.,
+            "gap_sum": float(valid_gaps.sum().item()) if valid_gaps.numel() else 0.,
+            "gap_count": int(valid_gaps.numel()),
+            "negative_finite_expert": int(
+                negative_has_expert_cost[valid_states].sum().item()),
+            "negative_expert_excluded": int(
+                (~negative_has_expert_cost[valid_states]).sum().item()),
+            "positive_count_sum": int(valid_positive_counts.sum().item()),
+            "positive_count_max": int(valid_positive_counts.max().item()) if valid_positive_counts.numel() else 0,
+            "negative_type_counts": negative_type_counts,
+            "decoder_error_type_counts": decoder_error_type_counts,
+            "delete_gap_sum": delete_gap_sum,
+            "delete_gap_count": delete_gap_count,
+            "delete_logit_advantage_sum": delete_logit_advantage_sum,
+            "delete_ranking_correct": delete_ranking_correct,
+            "delete_margin_satisfied": delete_margin_satisfied,
+        }
+        return losses
 
     def encoder_step(self, encoded_input: torch.tensor, is_training: bool = False) -> torch.tensor:
         """Runs the encoder.
@@ -743,6 +1051,8 @@ class Transducer(torch.nn.Module):
             The loss for sequences in the batch. The loss is calculated on sequence-level, i.e., for each sequence
             a single gradient is produced."""
         self.last_margin_statistics = None
+        self.last_focal_statistics = None
+        self.last_contrastive_statistics = None
         batch_size = encoded_input.size()[0]
 
         # adjust initial decoder states if batch_size has changed
@@ -779,6 +1089,18 @@ class Transducer(torch.nn.Module):
                 optimal_actions_mask,
                 valid_actions_mask,
                 self.focal_gamma,
+            )
+            losses = losses.sum(dim=0) / true_action_lengths
+            return losses
+        if self.expert_loss == "contrastive":
+            if expert_action_costs is None:
+                raise ValueError("Contrastive expert loss requires expert_action_costs.")
+            losses = self.contrastive_expert_loss(
+                logits,
+                expert_action_costs,
+                valid_actions_mask,
+                self.expert_margin,
+                self.contrastive_negative,
             )
             losses = losses.sum(dim=0) / true_action_lengths
             return losses
@@ -919,19 +1241,16 @@ class Transducer(torch.nn.Module):
     def output_symbol_for_action(self, input_: Union[str, List[str]],
                                  action: Union[int, Edit],
                                  alignment: Union[int, torch.tensor]) -> Any:
+        if torch.is_tensor(action):
+            action = action.item()
         if isinstance(action, int):
             action = self.vocab.decode_action(action)
-        if torch.is_tensor(alignment):
-            alignment = alignment.item()
-        if isinstance(action, ConditionalCopy):
-            return input_[alignment]
-        if isinstance(action, (ConditionalIns, ConditionalSub)):
-            return action.new
         if isinstance(action, BeginOfSequence):
             return vocabulary.BOS_OUTPUT
-        if isinstance(action, (ConditionalDel, EndOfSequence)):
+        effect = self.action_effect(input_, alignment, action)
+        if effect.output_symbol is None:
             return vocabulary.NO_OUTPUT
-        raise ValueError(f"Unknown action: {action}.")
+        return effect.output_symbol
 
     def output_symbol_id_for_action(self, input_: Union[str, List[str]],
                                     action: Union[int, Edit],
@@ -954,30 +1273,9 @@ class Transducer(torch.nn.Module):
                 alignment: The updated alignment.
                 stop: A bool indicating whether the end of sequence is reached.
             """
-        if isinstance(action, int):
-            action = self.vocab.decode_action(action)
-        stop = False
-
-        if isinstance(action, ConditionalCopy):
-            char_ = input_[alignment]
-            alignment += 1
-        elif isinstance(action, ConditionalDel):
-            char_ = ""
-            alignment += 1
-        elif isinstance(action, ConditionalIns):
-            char_ = action.new
-        elif isinstance(action, ConditionalSub):
-            char_ = action.new
-            alignment += 1
-        elif isinstance(action, EndOfSequence):
-            char_ = ""
-            stop = True
-        elif isinstance(action, BeginOfSequence):
-            char_ = ""
-        else:
-            raise ValueError(f"Unknown action: {action}.")
-
-        return char_, alignment, stop
+        effect = self.action_effect(input_, alignment, action)
+        char_ = "" if effect.output_symbol is None else effect.output_symbol
+        return char_, alignment + effect.alignment_delta, effect.stop
 
     def beam_search_decode(self, input_: str, encoded_input: torch.tensor,
                            encoded_features: Optional[torch.tensor],

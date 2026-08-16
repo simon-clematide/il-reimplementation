@@ -46,6 +46,79 @@ class OptimalSubstitutionExpertTests(unittest.TestCase):
         expected_action_scores = {EndOfSequence(): 0, Ins("b"): 1}
         self.assertEqual(expected_action_scores, action_scores)
 
+    def test_score_action_matches_score_for_expert_actions(self):
+        x = "cat"
+        i = 0
+        t = "kat"
+        y = ""
+        action_scores = self.optimal_expert.score(x, t, i, y)
+
+        for action, score in action_scores.items():
+            with self.subTest(action=action):
+                self.assertEqual(
+                    score,
+                    self.optimal_expert.score_action(x, t, i, y, action),
+                )
+
+    def test_score_state_returns_continuation_cost(self):
+        self.assertEqual(
+            0.,
+            self.optimal_expert.score_state("cat", "kat", 1, "k"),
+        )
+
+    def test_score_decoder_state_includes_prefix_damage(self):
+        score = self.optimal_expert.score_decoder_state("bat", "cat", 1, "b")
+
+        self.assertEqual(1., score.prefix_cost)
+        self.assertEqual(0., score.continuation_cost)
+        self.assertEqual(1., score.total)
+        self.assertEqual(1, score.target_prefix_index)
+
+    def test_score_decoder_state_recovers_after_wrong_prefix(self):
+        score = self.optimal_expert.score_decoder_state("cat", "kat", 1, "x")
+
+        self.assertLess(score.total, float("inf"))
+        self.assertGreaterEqual(score.prefix_cost, 1.)
+
+    def test_score_action_matches_action_cost_plus_successor_state(self):
+        x = "cat"
+        i = 0
+        t = "kat"
+        y = ""
+        action_scores = self.optimal_expert.score(x, t, i, y)
+
+        for action, score in action_scores.items():
+            with self.subTest(action=action):
+                if isinstance(action, Del):
+                    next_i = i + 1
+                    next_y = y
+                elif isinstance(action, Ins):
+                    next_i = i
+                    next_y = y + action.new
+                elif isinstance(action, (Copy, Sub)):
+                    next_i = i + 1
+                    next_y = y + action.new
+                elif isinstance(action, EndOfSequence):
+                    next_i = i
+                    next_y = y
+                else:
+                    raise AssertionError(f"Unexpected action: {action}")
+                expected = (
+                    self.optimal_expert.aligner.action_cost(action) +
+                    self.optimal_expert.score_state(x, t, next_i, next_y)
+                )
+                self.assertEqual(expected, score)
+
+    def test_roll_out_handles_copy_actions(self):
+        x = "cat"
+        i = 1
+        t = "kat"
+        y = "k"
+
+        action_scores = self.optimal_expert.score(x, t, i, y)
+
+        self.assertIn(Copy("a", "a"), action_scores)
+
     def test_correct_end(self):
         x = "walk"
         i = 4
@@ -115,6 +188,9 @@ class OptimalSubstitutionExpertTests(unittest.TestCase):
             if isinstance(action, Del):
                 i += 1
             elif isinstance(action, Ins):
+                y += action.new
+            elif isinstance(action, Copy):
+                i += 1
                 y += action.new
             elif isinstance(action, Sub):
                 i += 1

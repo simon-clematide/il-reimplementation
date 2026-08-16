@@ -8,11 +8,12 @@ from scipy.special import log_softmax
 import torch
 
 from trans import optimal_expert
+from trans import optimal_expert_substitutions
 from trans import transducer
 from trans import utils
 from trans import vocabulary
 from trans.actions import Copy, ConditionalCopy, ConditionalDel, \
-    ConditionalIns, ConditionalSub, Sub
+    ConditionalIns, ConditionalSub, Del, EndOfSequence, Ins, Sub
 
 
 np.random.seed(1)
@@ -185,6 +186,40 @@ class TransducerTests(unittest.TestCase):
             transducer_.output_symbol_for_action(source, vocabulary.BEGIN_WORD, 0),
         )
 
+    def test_action_effect_defines_decoder_transitions(self):
+        transducer_ = self.build_small_transducer()
+        transducer_.vocab.encode_actions(["x"])
+        source = ["a", "b"]
+
+        self.assertEqual(
+            transducer.ActionEffect("a", 1, False),
+            transducer_.action_effect(source, 0, vocabulary.COPY),
+        )
+        self.assertEqual(
+            transducer.ActionEffect(None, 1, False),
+            transducer_.action_effect(source, 0, vocabulary.DELETE),
+        )
+        self.assertEqual(
+            transducer.ActionEffect("x", 0, False),
+            transducer_.action_effect(source, 1, ConditionalIns("x")),
+        )
+        self.assertEqual(
+            transducer.ActionEffect("x", 1, False),
+            transducer_.action_effect(source, 1, ConditionalSub("x")),
+        )
+        self.assertEqual(
+            transducer.ActionEffect(None, 0, True),
+            transducer_.action_effect(source, 1, vocabulary.END_WORD),
+        )
+
+    def test_action_effect_accepts_tensor_action_id(self):
+        transducer_ = self.build_small_transducer()
+
+        self.assertEqual(
+            transducer.ActionEffect("a", 1, False),
+            transducer_.action_effect(["a"], 0, torch.tensor(vocabulary.COPY)),
+        )
+
     def test_output_feedback_disabled_has_legacy_decoder_input_dim(self):
         transducer_ = self.build_small_transducer(output_feedback_dim=0)
 
@@ -294,6 +329,15 @@ class TransducerTests(unittest.TestCase):
             focal[0, 0],
             torch.tensor(expected, dtype=torch.float),
         ))
+        self.assertEqual(1, transducer_.last_focal_statistics["states"])
+        self.assertTrue(torch.allclose(
+            torch.tensor([0.9]),
+            transducer_.last_focal_statistics["oracle_masses"],
+        ))
+        self.assertTrue(torch.allclose(
+            torch.tensor([(1. - 0.9) ** 2]),
+            transducer_.last_focal_statistics["focal_weights"],
+        ))
 
     def test_focal_marginal_loss_handles_padded_timesteps(self):
         transducer_ = self.build_small_transducer()
@@ -314,6 +358,7 @@ class TransducerTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(losses).all())
         self.assertTrue(torch.isfinite(logits.grad).all())
         self.assertTrue(torch.equal(torch.zeros_like(logits.grad[1]), logits.grad[1]))
+        self.assertEqual(1, transducer_.last_focal_statistics["states"])
 
     def test_normalized_soft_expert_loss_matches_expected_cross_entropy(self):
         transducer_ = self.build_small_transducer()
@@ -413,6 +458,121 @@ class TransducerTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(losses).all())
         self.assertTrue(torch.isfinite(logits.grad).all())
         self.assertTrue(torch.equal(torch.zeros_like(logits.grad[1]), logits.grad[1]))
+
+    def test_contrastive_expert_loss_uses_hard_negative(self):
+        transducer_ = self.build_small_transducer()
+        logits = torch.tensor([[[0.0, 2.0, 1.5, 4.0]]])
+        valid_actions = torch.tensor([[[True, True, True, True]]])
+        expert_costs = torch.tensor([[[float("inf"), 0.0, 0.0, 3.0]]])
+
+        losses = transducer_.contrastive_expert_loss(
+            logits,
+            expert_costs,
+            valid_actions,
+            margin=1.0,
+            negative_mode="hard",
+        )
+
+        positive_score = torch.logsumexp(torch.tensor([2.0, 1.5]), dim=0)
+        expected = torch.nn.functional.softplus(
+            torch.tensor(4.0) - positive_score + 1.0)
+        self.assertTrue(torch.allclose(losses, expected.view(1, 1)))
+        self.assertEqual(1, transducer_.last_contrastive_statistics["states"])
+        self.assertEqual(1, transducer_.last_contrastive_statistics["active"])
+        self.assertEqual(0, transducer_.last_contrastive_statistics["ranking_correct"])
+        self.assertEqual(1, transducer_.last_contrastive_statistics["gap_count"])
+        self.assertEqual(1, transducer_.last_contrastive_statistics["negative_finite_expert"])
+        self.assertEqual(0, transducer_.last_contrastive_statistics["negative_expert_excluded"])
+        self.assertEqual(2, transducer_.last_contrastive_statistics["positive_count_sum"])
+        self.assertEqual(2, transducer_.last_contrastive_statistics["positive_count_max"])
+        self.assertEqual(
+            1,
+            sum(transducer_.last_contrastive_statistics[
+                "negative_type_counts"].values()),
+        )
+
+    def test_contrastive_hard_negative_uses_decoder_valid_expert_excluded_action(self):
+        transducer_ = self.build_small_transducer()
+        logits = torch.full((1, 1, transducer_.number_actions), -10.0)
+        valid_actions = torch.zeros((1, 1, transducer_.number_actions), dtype=torch.bool)
+        expert_costs = torch.full(
+            (1, 1, transducer_.number_actions),
+            float("inf"),
+        )
+        valid_actions[0, 0, [vocabulary.COPY, vocabulary.DELETE]] = True
+        logits[0, 0, vocabulary.COPY] = 1.0
+        logits[0, 0, vocabulary.DELETE] = 5.0
+        expert_costs[0, 0, vocabulary.COPY] = 0.0
+
+        losses = transducer_.contrastive_expert_loss(
+            logits,
+            expert_costs,
+            valid_actions,
+            margin=1.0,
+            negative_mode="hard",
+        )
+
+        expected = torch.nn.functional.softplus(torch.tensor(5.0 - 1.0 + 1.0))
+        self.assertTrue(torch.allclose(losses, expected.view(1, 1)))
+        self.assertEqual(1, transducer_.last_contrastive_statistics["states"])
+        self.assertEqual(0, transducer_.last_contrastive_statistics["gap_count"])
+        self.assertEqual(0, transducer_.last_contrastive_statistics["negative_finite_expert"])
+        self.assertEqual(1, transducer_.last_contrastive_statistics["negative_expert_excluded"])
+        self.assertEqual(1, transducer_.last_contrastive_statistics["decoder_top_excluded"])
+        self.assertEqual(
+            1,
+            transducer_.last_contrastive_statistics[
+                "decoder_error_type_counts"]["DEL"],
+        )
+
+    def test_contrastive_expert_loss_handles_padded_timesteps(self):
+        transducer_ = self.build_small_transducer()
+        logits = torch.randn(2, 1, transducer_.number_actions, requires_grad=True)
+        valid_actions = torch.zeros(2, 1, transducer_.number_actions, dtype=torch.bool)
+        valid_actions[0, 0, [vocabulary.END_WORD, vocabulary.COPY]] = True
+        expert_costs = torch.full(
+            (2, 1, transducer_.number_actions),
+            float("inf"),
+        )
+        expert_costs[0, 0, vocabulary.END_WORD] = 0.
+        expert_costs[0, 0, vocabulary.COPY] = 1.
+
+        losses = transducer_.contrastive_expert_loss(
+            logits,
+            expert_costs,
+            valid_actions,
+            margin=1.0,
+            negative_mode="hard",
+        )
+        loss = losses.sum()
+        loss.backward()
+
+        self.assertTrue(torch.isfinite(losses).all())
+        self.assertTrue(torch.isfinite(logits.grad).all())
+        self.assertTrue(torch.equal(torch.zeros_like(logits.grad[1]), logits.grad[1]))
+
+    def test_contrastive_expert_loss_handles_state_without_negative(self):
+        transducer_ = self.build_small_transducer()
+        logits = torch.randn(1, 1, transducer_.number_actions, requires_grad=True)
+        valid_actions = torch.zeros(1, 1, transducer_.number_actions, dtype=torch.bool)
+        valid_actions[0, 0, vocabulary.COPY] = True
+        expert_costs = torch.full(
+            (1, 1, transducer_.number_actions),
+            float("inf"),
+        )
+        expert_costs[0, 0, vocabulary.COPY] = 0.
+
+        losses = transducer_.contrastive_expert_loss(
+            logits,
+            expert_costs,
+            valid_actions,
+            margin=1.0,
+            negative_mode="hard",
+        )
+        losses.sum().backward()
+
+        self.assertTrue(torch.equal(torch.zeros_like(losses), losses))
+        self.assertTrue(torch.isfinite(logits.grad).all())
 
     def test_decoder_step_clamps_alignment_lookup_indices(self):
         transducer_ = self.build_small_transducer()
@@ -991,6 +1151,167 @@ class TransducerTests(unittest.TestCase):
         expected = {ConditionalCopy(): 7., ConditionalSub("v"): 5.}
         remapped = self.transducer.remap_actions(action_scores)
         self.assertDictEqual(expected, remapped)
+
+    def test_expert_action_from_id_returns_conditional_action_key(self):
+        action_id = self.transducer.vocab.encode_unseen_action(ConditionalSub("b"))
+
+        action = self.transducer.expert_action_from_id("foo", action_id, 1)
+
+        self.assertEqual(ConditionalSub("b"), action)
+
+    def test_concrete_expert_action_from_id_uses_current_input_symbol(self):
+        action_id = self.transducer.vocab.encode_unseen_action(ConditionalSub("b"))
+
+        action = self.transducer.concrete_expert_action_from_id("foo", action_id, 1)
+
+        self.assertEqual(Sub("o", "b"), action)
+
+    def test_expert_score_action_scores_successor_state(self):
+        action_id = self.transducer.vocab.encode_unseen_action(ConditionalSub("b"))
+        seen = {}
+
+        class FakeAligner:
+            @staticmethod
+            def action_cost(action):
+                seen["action"] = action
+                return 2.
+
+        class FakeExpert:
+            aligner = FakeAligner()
+
+            @staticmethod
+            def score_state(input_, target, alignment, prediction):
+                seen["state"] = (input_, target, alignment, prediction)
+                return 5.
+
+        self.transducer.optimal_expert = FakeExpert()
+
+        score = self.transducer.expert_score_action(
+            "foo",
+            "bar",
+            1,
+            ["b"],
+            action_id,
+        )
+
+        self.assertEqual(7., score)
+        self.assertEqual(Sub("o", "b"), seen["action"])
+        self.assertEqual(("foo", "bar", 2, ["b", "b"]), seen["state"])
+
+    def test_expert_score_decoder_action_scores_action_result_state(self):
+        action_id = self.transducer.vocab.encode_unseen_action(ConditionalCopy())
+        seen = {}
+
+        class FakeExpert:
+            @staticmethod
+            def score_decoder_state(input_, target, alignment, prediction):
+                seen["state"] = (input_, target, alignment, prediction)
+                return "score"
+
+        self.transducer.optimal_expert = FakeExpert()
+
+        score = self.transducer.expert_score_decoder_action(
+            "foo",
+            "bar",
+            1,
+            ["b"],
+            action_id,
+        )
+
+        self.assertEqual("score", score)
+        self.assertEqual(("foo", "bar", 2, ["b", "o"]), seen["state"])
+
+    def test_expert_score_decoder_action_treats_eos_as_terminal(self):
+        action_id = vocabulary.END_WORD
+
+        class FakeExpert:
+            @staticmethod
+            def decoder_state_score(prefix_cost, continuation_cost, total,
+                                    target_prefix_index):
+                return optimal_expert_substitutions.DecoderStateScore(
+                    prefix_cost,
+                    continuation_cost,
+                    total,
+                    target_prefix_index,
+                )
+
+            @staticmethod
+            def score_decoder_state(input_, target, alignment, prediction):
+                raise AssertionError("EOS must not allow future SED completion.")
+
+        self.transducer.optimal_expert = FakeExpert()
+
+        score = self.transducer.expert_score_decoder_action(
+            "foo",
+            "bar",
+            1,
+            ["b"],
+            action_id,
+        )
+
+        self.assertEqual(2., score.prefix_cost)
+        self.assertEqual(0., score.continuation_cost)
+        self.assertEqual(2., score.total)
+        self.assertEqual(3, score.target_prefix_index)
+
+    def test_expert_score_action_matches_existing_expert_preferences(self):
+        vocabulary_ = vocabulary.Vocabularies(characters=["a", "c", "k", "t"])
+        vocabulary_.encode_actions(["a", "k", "t"])
+        expert = optimal_expert_substitutions.OptimalSubstitutionExpert(
+            optimal_expert_substitutions.EditDistanceAligner())
+        args = argparse.Namespace(
+            device='cpu',
+            char_dim=4,
+            action_dim=4,
+            enc_type='lstm',
+            enc_hidden_dim=4,
+            enc_layers=1,
+            enc_bidirectional=True,
+            enc_dropout=0.,
+            enc_output_dropout=0.,
+            enc_output_dropout_type="locked",
+            output_feedback_dim=0,
+            expert_temperature=0.,
+            expert_loss="marginal",
+            dec_hidden_dim=4,
+            dec_layers=1
+        )
+        transducer_ = transducer.Transducer(vocabulary_, expert, args)
+        states = [
+            (["c", "a", "t"], ["k", "a", "t"], 0, []),
+            (["c", "a", "t"], ["k", "a", "t"], 1, ["k"]),
+            (["c", "a", "t"], ["k", "a", "t"], 3, ["k", "a", "t"]),
+        ]
+
+        for input_, target, alignment, prediction in states:
+            action_scores = expert.score(input_, target, alignment, prediction)
+            for action, old_score in action_scores.items():
+                with self.subTest(state=(input_, target, alignment, prediction),
+                                  action=action):
+                    if isinstance(action, Copy):
+                        conditional_action = ConditionalCopy()
+                    elif isinstance(action, Sub):
+                        conditional_action = ConditionalSub(action.new)
+                    elif isinstance(action, Ins):
+                        conditional_action = ConditionalIns(action.new)
+                    elif isinstance(action, EndOfSequence):
+                        conditional_action = action
+                    elif isinstance(action, Del):
+                        conditional_action = ConditionalDel()
+                    else:
+                        raise AssertionError(f"Unexpected action: {action}")
+                    action_id = transducer_.encode_known_action(
+                        conditional_action,
+                        "test_expert_score_action_matches_existing_expert_preferences",
+                    )
+                    new_score = transducer_.expert_score_action(
+                        input_,
+                        target,
+                        alignment,
+                        prediction,
+                        action_id,
+                    )
+                    self.assertEqual(old_score, new_score)
 
     def test_expert_rollout(self):
         optimal_actions = self.transducer.expert_rollout(

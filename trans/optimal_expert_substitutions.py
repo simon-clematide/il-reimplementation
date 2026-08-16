@@ -2,10 +2,19 @@
 from typing import Any, Iterable, List, Sequence
 
 import numpy as np
+import dataclasses
 
 from trans import actions
 from trans import optimal_expert
 from trans.actions import Copy, Del, Edit, EndOfSequence, Ins, Sub
+
+
+@dataclasses.dataclass(frozen=True)
+class DecoderStateScore:
+    prefix_cost: float
+    continuation_cost: float
+    total: float
+    target_prefix_index: int
 
 
 class EditDistanceAligner(actions.Aligner):
@@ -55,6 +64,17 @@ class OptimalSubstitutionExpert(optimal_expert.OptimalExpert):
         super().__init__(maximum_output_length)
         self.aligner = aligner
 
+    @staticmethod
+    def decoder_state_score(prefix_cost: float, continuation_cost: float,
+                            total: float,
+                            target_prefix_index: int) -> DecoderStateScore:
+        return DecoderStateScore(
+            prefix_cost=prefix_cost,
+            continuation_cost=continuation_cost,
+            total=total,
+            target_prefix_index=target_prefix_index,
+        )
+
     def find_valid_actions(self, x: Sequence[Any], i: int, y: Sequence[Any],
                            prefixes: Iterable[optimal_expert.Prefix]):
         if len(y) >= self.maximum_output_length:
@@ -85,24 +105,77 @@ class OptimalSubstitutionExpert(optimal_expert.OptimalExpert):
         for actions_prefix in actions_prefixes:
             suffix_begin = actions_prefix.prefix.j
             for action in actions_prefix.actions:
-                if isinstance(action, Del):
-                    x_offset = i + 1
-                    t_offset = suffix_begin
-                elif isinstance(action, Ins):
-                    x_offset = i
-                    t_offset = suffix_begin + 1
-                elif isinstance(action, Sub):
-                    x_offset = i + 1
-                    t_offset = suffix_begin + 1
-                elif isinstance(action, EndOfSequence):
-                    x_offset = i
-                    t_offset = suffix_begin
-                else:
-                    raise ValueError(f"Unknown action: {action}")
-                sequence_cost = self.aligner.action_sequence_cost(
-                    x, t, x_offset, t_offset)
-                action_cost = self.aligner.action_cost(action)
-                cost = action_cost + sequence_cost
+                cost = self._action_cost_to_go(
+                    x,
+                    t,
+                    i,
+                    suffix_begin,
+                    action,
+                )
                 if action not in costs_to_go or costs_to_go[action] > cost:
                     costs_to_go[action] = cost
         return costs_to_go
+
+    def _action_cost_to_go(self, x: Sequence[Any], t: Sequence[Any],
+                           i: int, suffix_begin: int, action: Edit) -> float:
+        if isinstance(action, Copy):
+            x_offset = i + 1
+            t_offset = suffix_begin + 1
+        elif isinstance(action, Del):
+            x_offset = i + 1
+            t_offset = suffix_begin
+        elif isinstance(action, Ins):
+            x_offset = i
+            t_offset = suffix_begin + 1
+        elif isinstance(action, Sub):
+            x_offset = i + 1
+            t_offset = suffix_begin + 1
+        elif isinstance(action, EndOfSequence):
+            x_offset = i
+            t_offset = suffix_begin
+        else:
+            raise ValueError(f"Unknown action: {action}")
+        sequence_cost = self.aligner.action_sequence_cost(
+            x, t, x_offset, t_offset)
+        action_cost = self.aligner.action_cost(action)
+        return action_cost + sequence_cost
+
+    def score_action(self, x: Sequence[Any], t: Sequence[Any], i: int,
+                     y: Sequence[Any], action: Edit,
+                     prefixes: Iterable[optimal_expert.Prefix] = None) -> float:
+        if prefixes is None:
+            prefixes = self.find_prefixes(y, t)
+        costs = [
+            self._action_cost_to_go(x, t, i, prefix.j, action)
+            for prefix in prefixes
+        ]
+        if not costs:
+            raise ValueError("Cannot score action without any plausible target prefix.")
+        return min(costs)
+
+    def score_state(self, x: Sequence[Any], t: Sequence[Any], i: int,
+                    y: Sequence[Any],
+                    prefixes: Iterable[optimal_expert.Prefix] = None) -> float:
+        if prefixes is None:
+            prefixes = self.find_prefixes(y, t)
+        costs = [
+            self.aligner.action_sequence_cost(x, t, i, prefix.j)
+            for prefix in prefixes
+        ]
+        if not costs:
+            raise ValueError("Cannot score state without any plausible target prefix.")
+        return min(costs)
+
+    def score_decoder_state(self, x: Sequence[Any], t: Sequence[Any], i: int,
+                            y: Sequence[Any]) -> DecoderStateScore:
+        prefix_costs = optimal_expert.levenshtein_distance(y, t)[-1]
+        candidates = []
+        for j, prefix_cost in enumerate(prefix_costs):
+            continuation_cost = self.aligner.action_sequence_cost(x, t, i, j)
+            candidates.append(DecoderStateScore(
+                prefix_cost=float(prefix_cost),
+                continuation_cost=float(continuation_cost),
+                total=float(prefix_cost + continuation_cost),
+                target_prefix_index=j,
+            ))
+        return min(candidates, key=lambda score: score.total)

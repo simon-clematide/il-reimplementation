@@ -69,6 +69,10 @@ class TestBooleanArguments(unittest.TestCase):
         self.assertIn("--focal-start", result.stdout)
         self.assertIn("--focal-ramp", result.stdout)
         self.assertIn("--expert-margin", result.stdout)
+        self.assertIn("--contrastive-negative", result.stdout)
+        self.assertIn("--critic-model-action", result.stdout)
+        self.assertIn("--critic-augment-model-action", result.stdout)
+        self.assertIn("--reload-best-on-lr-reduction", result.stdout)
         self.assertIn("--rollin-prob", result.stdout)
         self.assertIn("--rollin-start", result.stdout)
         self.assertIn("--rollin-refresh", result.stdout)
@@ -123,6 +127,53 @@ class TestBooleanArguments(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
         self.assertIn(
             "--expert-loss=focal_marginal requires --expert-temperature=0",
+            result.stderr,
+        )
+
+    def test_contrastive_rejects_positive_expert_temperature(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "trans.train",
+                "--dev",
+                "dev.tsv",
+                "--output",
+                "out",
+                "--expert-loss",
+                "contrastive",
+                "--expert-temperature",
+                "1",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn(
+            "--expert-loss=contrastive requires --expert-temperature=0",
+            result.stderr,
+        )
+
+    def test_reload_best_on_lr_reduction_requires_reduce_on_plateau(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "trans.train",
+                "--dev",
+                "dev.tsv",
+                "--output",
+                "out",
+                "--reload-best-on-lr-reduction",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn(
+            "--reload-best-on-lr-reduction requires --scheduler=reduce_on_plateau",
             result.stderr,
         )
 
