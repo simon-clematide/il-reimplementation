@@ -10,4 +10,7 @@ __pycache__/
 # packaging
 *.egg
 *.egg-info/
+
+# local experiment workspace
+g2p-experiments/
 *.d
