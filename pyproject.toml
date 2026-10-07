@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "neural_transducer"
-version = "0.2.1"
+version = "0.3.0"
 description = "Neural transducer for grapheme-to-phoneme (Makarov & Clematide 2020)"
 authors = [
     { name = "Peter Makarov", email = "makarov@cl.uzh.ch" },

@@ -2,6 +2,7 @@
 import argparse
 import csv
 import json
+import math
 import os
 import tempfile
 import unittest
@@ -102,6 +103,61 @@ class DiagnoseTests(unittest.TestCase):
             1,
             stats.first_deviation["after_first_deviation"][
                 "expert_sub_model_copy"],
+        )
+
+    def test_expert_mapping_distribution_rows(self):
+        stats = diagnose.ExpertMappingStats()
+        stats.counts[("o", "COPY", "o")] = 9
+        stats.counts[("o", "SUB", "ɔ")] = 1
+        stats.source_totals["o"] = 10
+
+        rows = diagnose.expert_mapping_distribution_rows(stats)
+
+        self.assertEqual(2, len(rows))
+        copy_row = next(row for row in rows if row["expert_action"] == "COPY")
+        self.assertEqual("o", copy_row["source"])
+        self.assertEqual("o", copy_row["target"])
+        self.assertEqual(9, copy_row["count"])
+        self.assertAlmostEqual(0.9, copy_row["proportion_for_source"])
+
+    def test_sub_copy_error_training_rows_join_training_and_sed_probs(self):
+        replay_stats = diagnose.InferenceReplayStats()
+        replay_stats.expert_sub_model_copy_pairs["o->ɔ"] = 5
+        expert_stats = diagnose.ExpertMappingStats()
+        expert_stats.counts[("o", "COPY", "o")] = 9
+        expert_stats.counts[("o", "SUB", "ɔ")] = 1
+        expert_stats.source_totals["o"] = 10
+        sed_model = sed.StochasticEditDistance(sed.ParamDict(
+            delta_sub={
+                ("o", "o"): math.log(0.6),
+                ("o", "ɔ"): math.log(0.3),
+            },
+            delta_del={"o": math.log(0.05)},
+            delta_ins={"o": math.log(0.02), "ɔ": math.log(0.02)},
+            delta_eos=math.log(0.01),
+            source_alphabet=("o",),
+            target_alphabet=("o", "ɔ"),
+        ))
+
+        rows = diagnose.sub_copy_error_training_rows(
+            replay_stats,
+            expert_stats,
+            sed_model,
+        )
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual("o->ɔ", rows[0]["test_error"])
+        self.assertEqual(5, rows[0]["error_count"])
+        self.assertEqual(9, rows[0]["train_copy"])
+        self.assertEqual(1, rows[0]["train_same_sub"])
+        self.assertAlmostEqual(0.1, rows[0]["train_same_sub_share"])
+        self.assertAlmostEqual(
+            0.6 / 0.9,
+            rows[0]["sed_copy_probability_given_source"],
+        )
+        self.assertAlmostEqual(
+            0.3 / 0.9,
+            rows[0]["sed_sub_probability_given_source"],
         )
 
     def test_action_label_at_state_includes_source_symbol(self):
@@ -243,6 +299,7 @@ class DiagnoseTests(unittest.TestCase):
                 vocabulary=vocabulary_path,
                 sed_params=sed_path,
                 input=input_path,
+                training_input=input_path,
                 output=output_dir,
                 top_k_actions=3,
                 errors_only=False,
@@ -269,6 +326,10 @@ class DiagnoseTests(unittest.TestCase):
                 output_dir, "first_deviation_diagnostics.tsv")
             delete_diagnostics_path = os.path.join(
                 output_dir, "delete_diagnostics.tsv")
+            expert_mapping_distribution_path = os.path.join(
+                output_dir, "expert_mapping_distribution.tsv")
+            sub_copy_error_training_path = os.path.join(
+                output_dir, "sub_copy_error_training.tsv")
             self.assertTrue(os.path.exists(summary_path))
             self.assertTrue(os.path.exists(steps_path))
             self.assertTrue(os.path.exists(action_type_confusion_path))
@@ -280,6 +341,8 @@ class DiagnoseTests(unittest.TestCase):
             self.assertTrue(os.path.exists(expert_sub_model_copy_pairs_path))
             self.assertTrue(os.path.exists(first_deviation_path))
             self.assertTrue(os.path.exists(delete_diagnostics_path))
+            self.assertTrue(os.path.exists(expert_mapping_distribution_path))
+            self.assertTrue(os.path.exists(sub_copy_error_training_path))
 
             with open(summary_path, encoding="utf8") as f:
                 summary_rows = list(csv.DictReader(f, delimiter="\t"))
@@ -299,6 +362,10 @@ class DiagnoseTests(unittest.TestCase):
                 first_deviation_rows = list(csv.DictReader(f, delimiter="\t"))
             with open(delete_diagnostics_path, encoding="utf8") as f:
                 delete_diagnostic_rows = list(csv.DictReader(f, delimiter="\t"))
+            with open(expert_mapping_distribution_path, encoding="utf8") as f:
+                expert_mapping_rows = list(csv.DictReader(f, delimiter="\t"))
+            with open(sub_copy_error_training_path, encoding="utf8") as f:
+                sub_copy_training_rows = list(csv.DictReader(f, delimiter="\t"))
 
             self.assertEqual(1, len(summary_rows))
             self.assertEqual("a", summary_rows[0]["source"])
@@ -334,6 +401,15 @@ class DiagnoseTests(unittest.TestCase):
             if delete_diagnostic_rows:
                 self.assertIn("delete_regret", delete_diagnostic_rows[0])
                 self.assertIn("best_map_action", delete_diagnostic_rows[0])
+            self.assertGreaterEqual(len(expert_mapping_rows), 1)
+            self.assertIn("proportion_for_source", expert_mapping_rows[0])
+            self.assertIn(
+                "train_same_sub_share",
+                sub_copy_training_rows[0]
+                if sub_copy_training_rows else {
+                    "train_same_sub_share": "",
+                },
+            )
 
 
 if __name__ == "__main__":

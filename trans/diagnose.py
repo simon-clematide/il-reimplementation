@@ -229,6 +229,81 @@ class InferenceReplayStats:
         })
 
 
+@dataclasses.dataclass
+class ExpertMappingStats:
+    counts: collections.Counter = dataclasses.field(default_factory=collections.Counter)
+    source_totals: collections.Counter = dataclasses.field(
+        default_factory=collections.Counter)
+
+
+def mapping_action_components(
+        source: list[str],
+        alignment: int,
+        action: Any) -> Optional[tuple[str, str, str]]:
+    if not 0 <= alignment < len(source):
+        return None
+    source_symbol = source[alignment]
+    if isinstance(action, vocabulary.ConditionalCopy):
+        return source_symbol, "COPY", source_symbol
+    if isinstance(action, vocabulary.ConditionalSub):
+        return source_symbol, "SUB", action.new
+    return None
+
+
+def update_expert_mapping_stats(
+        stats: ExpertMappingStats,
+        model: transducer.Transducer,
+        sample: utils.Sample) -> None:
+    alignment = 0
+    prediction = []
+    stop = False
+    steps = 0
+    while not stop and steps <= transducer.MAX_ACTION_SEQ_LEN:
+        action_scores = model.expert_action_scores(
+            sample.input,
+            sample.target,
+            alignment,
+            prediction,
+        )
+        if not action_scores:
+            break
+        best_cost = min(action_scores.values())
+        for action, cost in action_scores.items():
+            if cost != best_cost:
+                continue
+            components = mapping_action_components(sample.input, alignment, action)
+            if components is None:
+                continue
+            source_symbol, action_name, target_symbol = components
+            stats.counts[(source_symbol, action_name, target_symbol)] += 1
+            stats.source_totals[source_symbol] += 1
+
+        oracle_actions = model.expert_rollout(
+            sample.input,
+            sample.target,
+            alignment,
+            prediction,
+        )
+        action = model.vocab.decode_action(oracle_actions[0])
+        char, alignment, stop = model.decode_single_action(
+            sample.input,
+            action,
+            alignment,
+        )
+        if char:
+            prediction.append(char)
+        steps += 1
+
+
+def collect_expert_mapping_stats(
+        model: transducer.Transducer,
+        samples: list[utils.Sample]) -> ExpertMappingStats:
+    stats = ExpertMappingStats()
+    for sample in samples:
+        update_expert_mapping_stats(stats, model, sample)
+    return stats
+
+
 def mapping_prediction_bucket(gold_action: Any, predicted_action: Any) -> Optional[str]:
     if isinstance(gold_action, vocabulary.ConditionalSub):
         if isinstance(predicted_action, vocabulary.ConditionalSub):
@@ -749,6 +824,81 @@ def expert_sub_model_copy_pair_rows(
     ]
 
 
+def expert_mapping_distribution_rows(
+        stats: ExpertMappingStats) -> list[dict[str, Any]]:
+    rows = []
+    for (source, action_name, target), count in sorted(stats.counts.items()):
+        total = stats.source_totals[source]
+        rows.append({
+            "source": source,
+            "expert_action": action_name,
+            "target": target,
+            "count": count,
+            "source_total": total,
+            "proportion_for_source": count / total if total else 0.,
+        })
+    return rows
+
+
+def mapping_key_parts(source_to_target: str) -> tuple[str, str]:
+    if "->" not in source_to_target:
+        return source_to_target, ""
+    return tuple(source_to_target.split("->", 1))
+
+
+def sed_map_probability_given_source(
+        aligner: sed.StochasticEditDistance,
+        source: str,
+        target: str) -> Any:
+    if not source or not target or not hasattr(aligner, "top_mappings"):
+        return ""
+    mappings = aligner.top_mappings(source, limit=None)
+    denom = sum(row["probability"] for row in mappings)
+    if denom == 0.:
+        return ""
+    for row in mappings:
+        if row["target"] == target:
+            return row["probability"] / denom
+    return 0.
+
+
+def sub_copy_error_training_rows(
+        replay_stats: InferenceReplayStats,
+        expert_mapping_stats: ExpertMappingStats,
+        aligner: sed.StochasticEditDistance) -> list[dict[str, Any]]:
+    rows = []
+    for source_to_target, error_count in (
+            replay_stats.expert_sub_model_copy_pairs.most_common()):
+        source, required_target = mapping_key_parts(source_to_target)
+        train_copy = expert_mapping_stats.counts[(source, "COPY", source)]
+        train_same_sub = expert_mapping_stats.counts[
+            (source, "SUB", required_target)]
+        train_total = train_copy + train_same_sub
+        rows.append({
+            "test_error": source_to_target,
+            "source": source,
+            "required_target": required_target,
+            "error_count": error_count,
+            "train_copy": train_copy,
+            "train_same_sub": train_same_sub,
+            "train_copy_same_sub_total": train_total,
+            "train_same_sub_share": (
+                train_same_sub / train_total if train_total else 0.
+            ),
+            "sed_copy_probability_given_source": (
+                sed_map_probability_given_source(aligner, source, source)
+            ),
+            "sed_sub_probability_given_source": (
+                sed_map_probability_given_source(
+                    aligner,
+                    source,
+                    required_target,
+                )
+            ),
+        })
+    return rows
+
+
 def first_deviation_rows(stats: InferenceReplayStats) -> list[dict[str, Any]]:
     rows = []
     for phase in ["before_first_deviation", "after_first_deviation"]:
@@ -789,6 +939,18 @@ def main(args: argparse.Namespace) -> None:
     model.eval()
 
     samples = read_samples(args.input, vocabularies, args.device, args.nfd)
+    training_mapping_stats = None
+    if getattr(args, "training_input", None):
+        training_samples = read_samples(
+            args.training_input,
+            vocabularies,
+            args.device,
+            args.nfd,
+        )
+        training_mapping_stats = collect_expert_mapping_stats(
+            model,
+            training_samples,
+        )
     summary_rows = []
     step_rows = []
     delete_rows = []
@@ -828,6 +990,10 @@ def main(args: argparse.Namespace) -> None:
     first_deviation_path = os.path.join(
         args.output, "first_deviation_diagnostics.tsv")
     delete_diagnostics_path = os.path.join(args.output, "delete_diagnostics.tsv")
+    expert_mapping_distribution_path = os.path.join(
+        args.output, "expert_mapping_distribution.tsv")
+    sub_copy_error_training_path = os.path.join(
+        args.output, "sub_copy_error_training.tsv")
     summary_fields = [
         "line_number", "source", "gold", "target", "prediction", "correct",
         "num_actions", "first_non_optimal_step", "num_non_optimal",
@@ -906,6 +1072,29 @@ def main(args: argparse.Namespace) -> None:
         "final_symbol_distance",
     ]
     write_tsv(delete_diagnostics_path, delete_rows, delete_fields)
+    if training_mapping_stats is not None:
+        write_tsv(
+            expert_mapping_distribution_path,
+            expert_mapping_distribution_rows(training_mapping_stats),
+            [
+                "source", "expert_action", "target", "count",
+                "source_total", "proportion_for_source",
+            ],
+        )
+        write_tsv(
+            sub_copy_error_training_path,
+            sub_copy_error_training_rows(
+                replay_stats,
+                training_mapping_stats,
+                sed_aligner,
+            ),
+            [
+                "test_error", "source", "required_target", "error_count",
+                "train_copy", "train_same_sub", "train_copy_same_sub_total",
+                "train_same_sub_share", "sed_copy_probability_given_source",
+                "sed_sub_probability_given_source",
+            ],
+        )
     logging.info("Wrote %s.", summary_path)
     logging.info("Wrote %s.", steps_path)
     logging.info("Wrote %s.", action_type_confusion_path)
@@ -917,6 +1106,9 @@ def main(args: argparse.Namespace) -> None:
     logging.info("Wrote %s.", expert_sub_model_copy_pairs_path)
     logging.info("Wrote %s.", first_deviation_path)
     logging.info("Wrote %s.", delete_diagnostics_path)
+    if training_mapping_stats is not None:
+        logging.info("Wrote %s.", expert_mapping_distribution_path)
+        logging.info("Wrote %s.", sub_copy_error_training_path)
 
 
 def cli_main() -> None:
@@ -935,6 +1127,11 @@ def cli_main() -> None:
                         help="Path to sed.pkl used by the expert.")
     parser.add_argument("--input", required=True,
                         help="TSV file with source and target columns.")
+    parser.add_argument(
+        "--training-input",
+        help=("Optional training TSV used to summarize expert COPY/SUB "
+              "mapping distributions and join them to inference errors."),
+    )
     parser.add_argument("--output", required=True,
                         help="Output directory for diagnostics TSV files.")
     parser.add_argument("--top-k-actions", type=int, default=5,
